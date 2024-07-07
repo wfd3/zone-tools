@@ -116,7 +116,7 @@ func generateGenerateStatements(startIP, endIP string, hostStart int, hostName s
 
 	if comments {
 		statements = append(statements,
-			fmt.Sprintf("; Creating $GENERATE directives for addresses %s through %s, %d hosts total", startIP, endIP, totalHosts))
+			fmt.Sprintf("; Creating $GENERATE directives for addresses %s through %s\n; %d hosts total", startIP, endIP, totalHosts))
 	}
 
 	var generateStatement string
@@ -142,6 +142,9 @@ func generateGenerateStatements(startIP, endIP string, hostStart int, hostName s
 				hostNameFormat(hostName, width, offset), hostNameFormat(hostName, width, offset+end), end-start)
 			statements = append(statements, generateStatement)
 		}
+
+		generateStatement = fmt.Sprintf(";$reverse-domain %s.%s.%s.in-addr.arpa.", currentIPParts[2], currentIPParts[1], currentIPParts[0])
+		statements = append(statements, generateStatement)
 
 		generateStatement = fmt.Sprintf("$GENERATE %d-%d %s IN A %s", start, end, hostPatternFormat(hostName, origin, offset, width), ipPattern)
 		statements = append(statements, generateStatement)
