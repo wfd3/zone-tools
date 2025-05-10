@@ -1,0 +1,75 @@
+lab			IN	A	10.0.0.25
+			IN	MX	0 mx
+			IN	TXT	"Shop bench computer"
+			IN	TXT	"kea: hw-address b8:ae:ed:79:87:14"
+
+walter-phone		IN	A	10.253.0.5
+	       		IN	MX	0 mx
+	       		IN	TXT	"Pixel 9 Pro (Walter)"
+			IN	TXT	"kea: hw-address fc:41:16:b6:da:6b, client-classes [kids]"
+
+zoe-phone		IN      A       10.253.0.6 ; Should error out
+                	IN      MX      0 mx
+                	IN      TXT     "Google Pixel 9 Pro (Zoe)"
+			IN	TXT	"kea: hw-address fc:41:16:b6:32:87, client-classes [kids]"
+		
+gamer		IN	A	10.253.0.7  ; No Kea output, invlaid key key
+			IN	MX	0 mx
+			IN	TXT	"Walter's Gaming Laptop"
+			;IN	TXT	"kea: hw-address 1c:ce:51:24:ef:ff, client-classes [kids], notatoken foobar"
+
+b6			IN	A 1.2.3.4
+b6			IN  TXT "kea:hw-address aa:aa:aa:aa:aa:aa"
+
+a0					IN					A 4.3.2.1
+		IN TXT "kea:client-classes [kids, dogs, cats]"
+
+; Generated test data
+
+; Single string, normal case
+a1 IN A 192.0.2.1
+a1 IN TXT "kea:hw-address 00:11:22:33:44:55"
+
+; Single string, trailing space
+a2 IN A 192.0.2.2
+a2 IN TXT "kea:hw-address 00:11:22:33:44:66 "
+
+; Multiple quoted strings
+a3 IN A 192.0.2.3
+a3 IN TXT "kea:hw-address 00:11:22:33:44:77" " client-classes [test]"
+
+; Quoted strings with leading/trailing whitespace
+a4 IN A 192.0.2.4
+a4 IN TXT "kea: hw-address 00:11:22:33:44:88 " " client-classes [lab] "
+
+; Escaped quotes inside string
+a5 IN A 192.0.2.5
+a5 IN TXT "kea:client-classes [\"engineering\"]," "hw-address 00:11:22:33:44:99"
+
+; Escaped backslash
+a6 IN A 192.0.2.6
+a6 IN TXT "kea:hw-address 00:11:22:33:44:\\66"
+
+; Mixed valid key order
+a7 IN A 192.0.2.7
+a7 IN TXT "kea:client-classes [dev]," " hw-address 00:11:22:33:44:aa"
+
+; No space between strings (still valid)
+a8 IN A 192.0.2.8
+a8 IN TXT "kea:hw-address 00:11:22:33:44:bb"" client-classes [qa]"
+
+; Empty string segment (should parse as empty)
+a9 IN A 192.0.2.9
+a9 IN TXT "" "kea: hw-address 00:11:22:33:44:cc"
+
+; Internal space and multiple fields
+a10 IN A 192.0.2.10
+; a10 IN TXT "kea:client-classes [prod, test]" " hw-address 00:11:22:33:44:dd" should not fail
+
+; multiple lines
+a11 IN A 192.0.2.11
+a11 IN TXT (
+  "kea:"
+  "client-classes [\"test\"],"
+  " hw-address 00:11:22:33:44:55"
+)
