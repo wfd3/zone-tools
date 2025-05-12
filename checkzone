@@ -1,0 +1,22 @@
+#!/bin/bash
+# 
+# Run named-checkzone to syntax check a zone file
+#
+
+QUIET="-q"
+
+ZONEFILE=$1
+DOMAIN="."
+
+echo -n " > $ZONEFILE: "
+if [[ "$1" != *.inaddr ]]; then
+    DOMAIN=$(grep "^\$ORIGIN" $ZONEFILE | awk '{print $2}')
+fi
+
+named-checkzone $QUIET $DOMAIN $ZONEFILE
+if [ $? -ne 0 ]; then
+    echo "INVALID"
+    exit 1
+fi
+
+echo "valid"
