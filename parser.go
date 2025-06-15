@@ -12,7 +12,7 @@ import (
 )
 
 // DEBUG enables debug logging
-const DEBUG = true
+const DEBUG = false
 
 // EntryType represents the type of zone file entry
 type EntryType int
@@ -268,7 +268,7 @@ func (p *Parser) parseFile(filename string) error {
 		Log("Processing line %d: %s", lineNum, line)
 
 		// Handle multi-line records
-		if strings.Contains(line, "(") {
+		if containsUnquotedParenthesis(line) {
 			line = p.handleMultiLine(scanner, line, &lineNum)
 			Log("After multi-line handling: %s", line)
 		}
@@ -308,13 +308,21 @@ func (p *Parser) handleMultiLine(scanner *bufio.Scanner, line string, lineNum *i
 	// Add content after opening parenthesis if any
 	if len(parts) > 1 {
 		content := strings.TrimLeft(parts[1], " ")
-		// Remove comments from this content
-		if commentIndex := strings.Index(content, ";"); commentIndex >= 0 {
-			content = content[:commentIndex]
-		}
+		// Remove comments from this content (but not if semicolon is inside quotes)
+		content = removeCommentsRespectingQuotes(content)
 		if strings.TrimSpace(content) != "" {
-			continuedLine.WriteString(" ")
-			continuedLine.WriteString(strings.TrimSpace(content))
+			trimmedContent := strings.TrimSpace(content)
+			Log("First line content after '(': '%s'", trimmedContent)
+			// If this is a quoted string, extract the content without quotes
+			if strings.HasPrefix(trimmedContent, "\"") && strings.HasSuffix(trimmedContent, "\"") && strings.Count(trimmedContent, "\"") == 2 {
+				unquotedContent := trimmedContent[1 : len(trimmedContent)-1]
+				continuedLine.WriteString(" \"")
+				continuedLine.WriteString(unquotedContent)
+				Log("Initial quoted content: '%s'", unquotedContent)
+			} else {
+				continuedLine.WriteString(" ")
+				continuedLine.WriteString(trimmedContent)
+			}
 		}
 	}
 
@@ -324,10 +332,8 @@ func (p *Parser) handleMultiLine(scanner *bufio.Scanner, line string, lineNum *i
 		*lineNum++
 		nextLine := scanner.Text()
 
-		// Remove comments from continuation line
-		if commentIndex := strings.Index(nextLine, ";"); commentIndex >= 0 {
-			nextLine = nextLine[:commentIndex]
-		}
+		// Remove comments from continuation line (but not if semicolon is inside quotes)
+		nextLine = removeCommentsRespectingQuotes(nextLine)
 		nextLine = strings.TrimSpace(nextLine)
 
 		if strings.Contains(nextLine, ")") {
@@ -342,13 +348,29 @@ func (p *Parser) handleMultiLine(scanner *bufio.Scanner, line string, lineNum *i
 		}
 
 		if nextLine != "" {
-			continuedLine.WriteString(" ")
-			continuedLine.WriteString(nextLine)
+			trimmedNext := strings.TrimSpace(nextLine)
+			
+			// If this is a standalone quoted string, remove quotes and concatenate content directly
+			if strings.HasPrefix(trimmedNext, "\"") && strings.HasSuffix(trimmedNext, "\"") && strings.Count(trimmedNext, "\"") == 2 {
+				// Extract content between quotes (preserving any internal spaces)
+				unquotedContent := trimmedNext[1 : len(trimmedNext)-1]
+				continuedLine.WriteString(unquotedContent)
+				Log("Concatenating quoted string content: '%s'", unquotedContent)
+			} else {
+				// Normal space-separated concatenation
+				continuedLine.WriteString(" ")
+				continuedLine.WriteString(nextLine)
+			}
 		}
 	}
 
 	if foundClosing {
-		return continuedLine.String()
+		result := continuedLine.String()
+		// If we were concatenating quoted strings, add closing quote
+		if strings.Contains(result, " \"") && !strings.HasSuffix(result, "\"") {
+			result += "\""
+		}
+		return result
 	}
 	return line
 }
@@ -486,11 +508,13 @@ func (p *Parser) handleDirective(line, filename string, currentName *string, ori
 
 // parseRecord parses a single DNS record
 func (p *Parser) parseRecord(line string, currentName *string, origLine string) error {
-	// Pre-process the line to extract comments
+	// Pre-process the line to extract comments (respecting quotes)
 	var cleanLine string
 	comment := ""
 
-	if commentIndex := strings.Index(line, ";"); commentIndex >= 0 {
+	// Find comment start (semicolon outside quotes)
+	commentIndex := findCommentStart(line)
+	if commentIndex >= 0 {
 		comment = line[commentIndex:]
 		cleanLine = line[:commentIndex]
 	} else {
@@ -523,7 +547,22 @@ func (p *Parser) parseRecord(line string, currentName *string, origLine string) 
 	tokenIndex := 0
 
 	// Parse owner name (if present)
-	if !isNumeric(tokens[tokenIndex]) && tokens[tokenIndex] != "IN" && !isKnownRRType(tokens[tokenIndex]) {
+	// Look ahead to determine if first token is actually a hostname
+	if len(tokens) >= 3 && isKnownRRType(tokens[2]) {
+		// Pattern: name [ttl] [class] type data...
+		// If tokens[2] is a known RR type, then tokens[0] must be a hostname
+		name = tokens[tokenIndex]
+		tokenIndex++
+	} else if len(tokens) >= 4 && tokens[1] == "IN" && isKnownRRType(tokens[2]) {
+		// Pattern: name class type data...
+		name = tokens[tokenIndex]
+		tokenIndex++
+	} else if len(tokens) >= 4 && isNumeric(tokens[1]) && isKnownRRType(tokens[3]) {
+		// Pattern: name ttl class type data...
+		name = tokens[tokenIndex]
+		tokenIndex++
+	} else if !isNumeric(tokens[tokenIndex]) && tokens[tokenIndex] != "IN" && !isKnownRRType(tokens[tokenIndex]) {
+		// Original logic as fallback
 		name = tokens[tokenIndex]
 		tokenIndex++
 	} else {
@@ -913,6 +952,43 @@ var knownRRTypes = map[string]bool{
 // isKnownRRType checks if a string is a known DNS record type
 func isKnownRRType(s string) bool {
 	return knownRRTypes[strings.ToUpper(s)]
+}
+
+// containsUnquotedParenthesis checks if a line contains an opening parenthesis outside of quotes
+func containsUnquotedParenthesis(line string) bool {
+	inQuotes := false
+	for i := 0; i < len(line); i++ {
+		char := line[i]
+		if char == '"' {
+			inQuotes = !inQuotes
+		} else if char == '(' && !inQuotes {
+			return true
+		}
+	}
+	return false
+}
+
+// removeCommentsRespectingQuotes removes comments (semicolon to end of line) but only if semicolon is outside quotes
+func removeCommentsRespectingQuotes(line string) string {
+	commentIndex := findCommentStart(line)
+	if commentIndex >= 0 {
+		return line[:commentIndex]
+	}
+	return line
+}
+
+// findCommentStart finds the index of the first semicolon outside quotes, or -1 if none found
+func findCommentStart(line string) int {
+	inQuotes := false
+	for i := 0; i < len(line); i++ {
+		char := line[i]
+		if char == '"' {
+			inQuotes = !inQuotes
+		} else if char == ';' && !inQuotes {
+			return i
+		}
+	}
+	return -1
 }
 
 // replacePlaceholders replaces $GENERATE placeholders with the iterator value
