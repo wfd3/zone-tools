@@ -4,7 +4,7 @@
 GO := go
 
 # Binary names
-BINARIES := dhcpgen mkarpa mkkea parser mkarpa3
+BINARIES := dhcpgen mkarpa mkkea parser
 
 # Default target
 .PHONY: all
@@ -14,17 +14,14 @@ all: $(BINARIES) test
 dhcpgen: dhcpgen.go
 	$(GO) build -o dhcpgen dhcpgen.go
 
-mkarpa: mkarpa.go
-	$(GO) build -o mkarpa mkarpa.go
-
 mkkea: mkkea.go
 	$(GO) build -o mkkea mkkea.go
 
 parser: parser_example.go
 	$(GO) build -o parser parser_example.go
 
-mkarpa3: mkarpa3.go
-	$(GO) build -o mkarpa3 mkarpa3.go
+mkarpa: mkarpa.go
+	$(GO) build -o mkarpa mkarpa.go
 
 # Run tests
 .PHONY: test
@@ -58,7 +55,7 @@ vet:
 	$(GO) vet ./mkarpa.go
 	$(GO) vet ./mkkea.go
 	$(GO) vet ./parser_example.go
-	$(GO) vet ./mkarpa3.go
+	$(GO) vet ./mkarpa.go
 	$(GO) vet ./zoneparser
 
 # Run all quality checks
