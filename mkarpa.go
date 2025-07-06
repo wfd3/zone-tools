@@ -1,133 +1,92 @@
 package main
 
-// Generate reverse zone files from one or more forward zones
+// mkarpa3 - Generate DNS reverse zone files from forward zone files
+//
+// This program reads one or more DNS forward zone files using the zoneparser library,
+// and generates a reverse zone file containing PTR records for all A records found that
+// are not marked with ";inaddr" comments.
+//
+// Features:
+// - Converts A records to PTR records in appropriate reverse zones
+// - Processes $GENERATE directives for A records and converts them to PTR directives
+// - Handles $INCLUDE files and marks transitions with comments
+// - Supports both input-order preservation and numerical IP address sorting
+// - Extracts SOA information from the first zone file processed
+// - Automatically qualifies hostnames with the SOA domain
+//
+// Usage:
+//   mkarpa3 [-o output_file] [-d reverse_domain] [-s] zone_file [zone_file ...]
+//
 
 import (
-	"bufio"
-	"container/list"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"zone-tools/zoneparser"
 )
 
-type soa_t struct {
-	authns  string
-	domain  string
-	contact string
-	serial  uint64
-	refresh uint64
-	retry   uint64
-	expire  uint64
-	minimum uint64
-	ns      []string
+type soaInfo struct {
+	authns      string
+	domain      string
+	contact     string
+	serial      uint32
+	refresh     uint32
+	retry       uint32
+	expire      uint32
+	minimum     uint32
+	nameservers []string
+}
+
+type ptrRecord struct {
+	lastOctet string
+	hostname  string
+}
+
+type reverseZone struct {
+	origin    string
+	records   []ptrRecord
+	generates []string
+	comments  []string // Comments to include before this zone's records
 }
 
 var domain string
 var ttl string
-var soa soa_t
-var NS_A_RR string
+var soa soaInfo
+var nsARecord string
+var reverseZones map[string]*reverseZone
+var reverseZoneOrder []string    // Track order of zone creation
+var currentIncludeFile string    // Track current include file being processed
+var includeFileCommentAdded bool // Track if we've already added a comment for current include file
 
-var zone *list.List
-
-// Regular expressions
-var IN_A = regexp.MustCompile(`IN[\s|\t]+A`)
-var IN_NS = regexp.MustCompile(`IN[\s|\t]+NS`)
-var IN_SOA = regexp.MustCompile(`IN[\s|\t]+SOA`)
-
-var splitSpace = regexp.MustCompile(`[\s+|\t+]`)
-var StartsWithLetterOrNumber = regexp.MustCompile(`^\w`)
-var StartsWithWhiteSpace = regexp.MustCompile(`^\s+\S`)
-var commentToEndOfLine = regexp.MustCompile(`;.*`)
-
-//
-// helper functions
-//
-
-func okToShow(s string) bool {
-	no_show := strings.Contains(s, ";inaddr") || strings.Contains(s, "; inaddr") || strings.Contains(s, ";in-addr") || strings.Contains(s, "; in-addr")
-	return !no_show
-}
-
-func removeFirstField(s string, sep string) (string, string) {
-	fields := strings.Split(s, sep)
-
-	if len(fields) <= 1 {
-		panic("Too few fields")
-	}
-
-	return fields[0], strings.Join(fields[1:], sep)
-}
-
-func fqdn(host, domain string) string {
-	if strings.HasSuffix(host, ".") {
-		return host
-	}
-
-	if domain == "" {
-		return host
-	}
-
-	fqdn := strings.Join([]string{host, domain}, ".")
-	if !strings.HasSuffix(fqdn, ".") {
-		fqdn += "."
-	}
-
-	return fqdn
-}
-
-func atoui64(v string) uint64 {
-	var u uint64
-	var err error
-	if u, err = strconv.ParseUint(v, 10, 64); err != nil {
-		fmt.Fprintf(os.Stderr, "Parse Error: %s\n", err)
-		os.Exit(1)
-	}
-	return u
-}
-
-func stripComments(line string) string {
-	commentIndex := strings.IndexByte(line, ';')
-	if commentIndex == -1 {
-		return line
-	}
-
-	return line[:commentIndex]
-}
-
-// Save NS RR's, ensuring that each is added only once.
-// This is O(n) but n should be *tiny* so there's no need for anything
-// fancy here.
-func saveNS(ns string) {
-	for _, v := range soa.ns {
-		if v == ns {
-			return
-		}
-	}
-	soa.ns = append(soa.ns, ns)
-}
-
-func isInNS(ns string) bool {
-	for _, v := range soa.ns {
-		if v == ns {
+// Helper function to check if a hostname is a nameserver
+func isNameServer(hostname string) bool {
+	for _, ns := range soa.nameservers {
+		if ns == hostname {
 			return true
 		}
 	}
 	return false
 }
 
+// Add a nameserver to the list if not already present
+func addNameServer(ns string) {
+	for _, existing := range soa.nameservers {
+		if existing == ns {
+			return
+		}
+	}
+	soa.nameservers = append(soa.nameservers, ns)
+}
+
 // Find the common domain between two different hostnames
 func commonDomain(h1, h2 string) string {
-	var common string
-
 	if h1 == "" && h2 == "" {
-		panic("NULL hosts")
+		return ""
 	}
 	if h1 == "" {
 		return h2
@@ -140,6 +99,8 @@ func commonDomain(h1, h2 string) string {
 	a2 := strings.Split(strings.TrimSuffix(h2, "."), ".")
 	a1len := len(a1)
 	a2len := len(a2)
+	var common string
+
 	for {
 		if a1len == 0 || a2len == 0 {
 			break
@@ -154,15 +115,50 @@ func commonDomain(h1, h2 string) string {
 	return common
 }
 
-// Convert a $GENERATE directive for A records to a $GENERATE directive for PTR records.
-func ConvertGenerate(directive string) (string, error) {
-	parts := strings.Fields(directive)
-	if parts[0] != "$GENERATE" || (len(parts) < 6 && parts[3] == "IN" && parts[4] != "A") {
-		return "", fmt.Errorf("invalid $GENERATE directive")
+// Create reverse zone origin from IP address (e.g., "10.0.1.2" -> "1.0.10.in-addr.arpa.")
+func createReverseOrigin(ip string) string {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return ""
+	}
+	// For IP a.b.c.d, reverse origin is c.b.a.in-addr.arpa.
+	return fmt.Sprintf("%s.%s.%s.in-addr.arpa.", parts[2], parts[1], parts[0])
+}
+
+// Get the reverse zone for an IP address
+func getReverseZone(ip string) *reverseZone {
+	origin := createReverseOrigin(ip)
+	if origin == "" {
+		return nil
+	}
+
+	if reverseZones[origin] == nil {
+		reverseZones[origin] = &reverseZone{
+			origin:    origin,
+			records:   make([]ptrRecord, 0),
+			generates: make([]string, 0),
+			comments:  make([]string, 0),
+		}
+		// Add include file comment if we're processing an included file (only once per file)
+		if currentIncludeFile != "" && !includeFileCommentAdded {
+			reverseZones[origin].comments = append(reverseZones[origin].comments,
+				fmt.Sprintf("; From $INCLUDE file %s", currentIncludeFile))
+			includeFileCommentAdded = true
+		}
+		// Track order of zone creation
+		reverseZoneOrder = append(reverseZoneOrder, origin)
+	}
+	return reverseZones[origin]
+}
+
+// Convert a $GENERATE directive for A records to PTR records
+func convertGenerate(gen *zoneparser.GenerateDirective) (string, error) {
+	if gen.RRType != "A" {
+		return "", fmt.Errorf("can only convert A record GENERATE directives")
 	}
 
 	// Parse the range
-	rangeParts := strings.Split(parts[1], "-")
+	rangeParts := strings.Split(gen.Range, "-")
 	if len(rangeParts) != 2 {
 		return "", fmt.Errorf("invalid range in $GENERATE directive")
 	}
@@ -183,215 +179,169 @@ func ConvertGenerate(directive string) (string, error) {
 		}
 	}
 
-	// Parse LHS and RHS
-	lhs := parts[2]
-	rhsTemplate := parts[len(parts)-1]
-
+	// Create PTR directive
 	ptrDirective := fmt.Sprintf("$GENERATE %d-%d", start, stop)
 	if step != 1 {
 		ptrDirective += fmt.Sprintf("/%d", step)
 	}
 
-	rhsParts := strings.Split(rhsTemplate, ".")
+	// Parse IP template to get the last octet placeholder
+	rhsParts := strings.Split(gen.RData, ".")
 	if len(rhsParts) != 4 {
 		return "", fmt.Errorf("invalid IP address format in template")
 	}
 
-	reverseTemplate := fmt.Sprintf("%s", rhsParts[3])
-	ptrDirective += fmt.Sprintf(" %s IN PTR %s", reverseTemplate, fqdn(lhs, soa.domain))
+	reverseTemplate := rhsParts[3]
 
+	// Qualify the owner name with the SOA domain if needed
+	ownerName := gen.OwnerName
+	if !strings.HasSuffix(ownerName, ".") {
+		ownerName = ownerName + "." + soa.domain
+		if !strings.HasSuffix(ownerName, ".") {
+			ownerName += "."
+		}
+	}
+
+	ptrDirective += fmt.Sprintf(" %s IN PTR %s", reverseTemplate, ownerName)
 	return ptrDirective, nil
 }
 
-func processMkarpaDirecive(s string) {
-	if strings.HasPrefix(s, ";$reverse-domain ") && domain == "" {
-		fields := strings.Fields(s)
-		rd := fields[1]
-		rdlen := len(rd)
-		if rdlen > 0 && rd[rdlen-1] != '.' {
-			rd += "."
-		}
-		zone.PushBack(fmt.Sprintf("$ORIGIN %s", rd))
+// Format SOA record for output
+func formatSOA() string {
+	result := fmt.Sprintf("@\tIN\tSOA\t%s\t%s.%s (\n",
+		soa.authns, soa.contact, soa.domain)
+	result += fmt.Sprintf("\t\t\t\t%d\t ; Serial\n", soa.serial)
+	result += fmt.Sprintf("\t\t\t\t%d\t\t ; Refresh\n", soa.refresh)
+	result += fmt.Sprintf("\t\t\t\t%d\t\t ; Retry\n", soa.retry)
+	result += fmt.Sprintf("\t\t\t\t%d\t\t ; Expire\n", soa.expire)
+	result += fmt.Sprintf("\t\t\t\t%d )\t\t ; Minimum\n", soa.minimum)
+	for _, ns := range soa.nameservers {
+		result += fmt.Sprintf("\t\tIN\tNS\t%s\n", ns)
 	}
+	return result
 }
 
-// SOA
-func (s *soa_t) String() string {
-	t := fmt.Sprintf("@\tIN\tSOA\t%s\t%s.%s (\n",
-		s.authns, s.contact, s.domain)
-	t += fmt.Sprintf("\t\t\t\t%d\t ; Serial\n", s.serial)
-	t += fmt.Sprintf("\t\t\t\t%d\t\t ; Refresh\n", s.refresh)
-	t += fmt.Sprintf("\t\t\t\t%d\t\t ; Retry\n", s.retry)
-	t += fmt.Sprintf("\t\t\t\t%d\t\t ; Expire\n", s.expire)
-	t += fmt.Sprintf("\t\t\t\t%d )\t\t ; Minimum\n", s.minimum)
-	for _, ns := range s.ns {
-		t += fmt.Sprintf("\t\tIN\tNS\t%s\n", ns)
-	}
-	return t
-}
-
-func parseSOA(s string, r *bufio.Reader) {
-	var domain string
-	var contact string
-	var authns string
-
-	splits := strings.Fields(s)
-	if len(splits) == 6 && splits[1] == "IN" { // No TTL in SOA
-		authns = splits[3]
-		contact = splits[4]
-	} else { // TTL in SOA
-		if ttl == "" {
-			ttl = "$TTL " + splits[1]
-		}
-		authns = splits[4]
-		contact = splits[5]
-	}
-
-	contact, domain = removeFirstField(contact, ".")
-	soa.domain = commonDomain(domain, soa.domain)
-	soa.contact = contact
-	soa.authns = authns
-	saveNS(authns)
-
-	t, err := r.ReadString(')')
+// Parse zone file using the new zoneparser library
+func parseZoneFile(inputFile string) error {
+	parser := zoneparser.NewParser(inputFile)
+	zoneData, metadata, err := parser.Parse()
 	if err != nil {
-		panic(err)
-	}
-	t = commentToEndOfLine.ReplaceAllString(t, "")
-	tlist := strings.Split(t, "\n")
-	for i := range tlist {
-		tlist[i] = strings.TrimSuffix(tlist[i], ")")
-		tlist[i] = strings.TrimSpace(tlist[i])
-
+		return fmt.Errorf("error parsing zone file %s: %v", inputFile, err)
 	}
 
-	soa.serial = atoui64(tlist[0])
-	soa.refresh = atoui64(tlist[1])
-	soa.retry = atoui64(tlist[2])
-	soa.expire = atoui64(tlist[3])
-	soa.minimum = atoui64(tlist[4])
-}
+	// Set default TTL if not already set
+	if ttl == "" {
+		ttl = fmt.Sprintf("$TTL %d", metadata.TTL)
+	}
 
-// Zonefile parsing
-func parseOneZone(r *bufio.Reader) {
-	var lastHost string
-	var line uint32
-
-	for {
-		line++
-		s, err := r.ReadString('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			fmt.Fprintf(os.Stderr, "IO Error: Line %d: %s\n", line, err)
-			os.Exit(1)
+	// Process each entry in the zone
+	var lastSourceFile string
+	for _, entry := range zoneData {
+		// Track source file changes for include file comments
+		if entry.SourceFile != lastSourceFile && entry.SourceFile != inputFile {
+			currentIncludeFile = entry.SourceFile
+			includeFileCommentAdded = false // Reset flag for new include file
+			lastSourceFile = entry.SourceFile
+		} else if entry.SourceFile == inputFile {
+			currentIncludeFile = ""
+			includeFileCommentAdded = false
+			lastSourceFile = entry.SourceFile
 		}
 
-		s = strings.TrimSpace(s)
+		switch entry.Type {
+		case zoneparser.EntryTypeRecord:
+			processHostRecord(entry.HostRecord)
 
-		// Look for mkarpa directives.  They are of the form "^;$<directive> options
-		if strings.HasPrefix(s, ";$") {
-			processMkarpaDirecive(s)
-			continue
-		}
-
-		if strings.HasPrefix(s, ";") || strings.HasPrefix(s, "\n") || strings.HasPrefix(s, "$ORIGIN") {
-			continue
-		}
-
-		show := okToShow(s)
-
-		s = stripComments(s)
-
-		if strings.HasPrefix(s, "$GENERATE") {
-			s, err := ConvertGenerate(s)
-			if err == nil {
-				zone.PushBack(s)
-			}
-			continue
-		}
-
-		if strings.HasPrefix(s, "$INCLUDE") {
-			splits := strings.Fields(s)
-			zone.PushBack("\n; Processed from $INCLUDE file " + splits[1])
-			parseZone(splits[1])
-			continue
-		}
-
-		if strings.HasPrefix(s, "$TTL") {
-			ttl = s
-			continue
-		}
-
-		if IN_SOA.MatchString(s) {
-			parseSOA(s, r)
-			lastHost = "SOA"
-			continue
-		}
-
-		// Save nameservers lists as part of SOA RR
-		if IN_NS.MatchString(s) && lastHost == "SOA" {
-			splits := strings.Fields(s)
-			saveNS(splits[2])
-			continue
-		}
-
-		// Looking at a complete A RR "host IN A 1.2.3.4"
-		if StartsWithLetterOrNumber.MatchString(s) && IN_A.MatchString(s) {
-			var addr string
-
-			i := strings.IndexAny(s, ";")
-			if i != -1 {
-				s = s[0:i]
-			}
-
-			splits := strings.Fields(s)
-			switch len(splits) {
-			case 4:
-				lastHost = fqdn(splits[0], soa.domain)
-				addr = splits[3]
-			default:
-				fmt.Fprintf(os.Stderr, "Parse Error: line %d\n", line)
-				fmt.Fprintf(os.Stderr, "Line: %s\n", s)
-				os.Exit(1)
-			}
-
-			if show {
-				s := strings.Split(addr, ".")
-				zone.PushBack(fmt.Sprintf("%s\t\tIN\tPTR\t\t%s", s[3], lastHost))
-			} else {
-				// Check if current host is an identified NS, add an A RR if so.
-				if isInNS(lastHost) {
-					NS_A_RR = fmt.Sprintf("%s\t\tIN\tA\t%s ;inaddr", lastHost, addr)
+		case zoneparser.EntryTypeGenerate:
+			if entry.Generate.RRType == "A" {
+				if ptrDirective, err := convertGenerate(entry.Generate); err == nil {
+					// Add the GENERATE directive to the appropriate reverse zone
+					// For now, we need to determine which reverse zone this belongs to
+					// by parsing the IP template in the GENERATE directive
+					rhsParts := strings.Split(entry.Generate.RData, ".")
+					if len(rhsParts) == 4 {
+						// Create a sample IP to determine the reverse zone
+						sampleIP := fmt.Sprintf("%s.%s.%s.1", rhsParts[0], rhsParts[1], rhsParts[2])
+						reverseZone := getReverseZone(sampleIP)
+						if reverseZone != nil {
+							reverseZone.generates = append(reverseZone.generates, ptrDirective)
+						}
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "Warning: Error converting GENERATE directive: %v\n", err)
 				}
 			}
-			continue
+
 		}
 	}
+
+	return nil
 }
 
-func parseZone(inputFile string) {
+// Process a host record and extract relevant information
+func processHostRecord(host *zoneparser.HostRecord) {
+	hostname := host.Hostname
+	records := &host.Records
 
-	in, err := os.Open(inputFile)
-	if err != nil {
-		fmt.Printf("Error opening input file: %v\n", err)
-		os.Exit(1)
+	// Process SOA records
+	for _, soaRecord := range records.SOA {
+		if soa.domain == "" {
+			// Extract domain from email field
+			emailParts := strings.Split(soaRecord.Email, ".")
+			if len(emailParts) > 1 {
+				soa.domain = strings.Join(emailParts[1:], ".")
+			}
+		}
+		soa.domain = commonDomain(soa.domain, strings.TrimSuffix(hostname, "."))
+		soa.contact = strings.Split(soaRecord.Email, ".")[0]
+		soa.authns = soaRecord.PrimaryNS
+		soa.serial = soaRecord.Serial
+		soa.refresh = soaRecord.Refresh
+		soa.retry = soaRecord.Retry
+		soa.expire = soaRecord.Expire
+		soa.minimum = soaRecord.MinimumTTL
+		addNameServer(soaRecord.PrimaryNS)
 	}
 
-	r := bufio.NewReader(in)
-	parseOneZone(r)
-	in.Close()
+	// Process NS records
+	for _, nsRecord := range records.NS {
+		addNameServer(nsRecord.NameServer)
+	}
+
+	// Process A records
+	for _, aRecord := range records.A {
+		// Check if this should be shown (not marked as inaddr)
+		show := !aRecord.Inaddr
+
+		if show {
+			// Create PTR record and add to appropriate reverse zone
+			addrParts := strings.Split(aRecord.Address.String(), ".")
+			if len(addrParts) == 4 {
+				reverseZone := getReverseZone(aRecord.Address.String())
+				if reverseZone != nil {
+					reverseZone.records = append(reverseZone.records, ptrRecord{
+						lastOctet: addrParts[3],
+						hostname:  hostname,
+					})
+				}
+			}
+		} else {
+			// Check if this host is a nameserver, if so save the A record
+			if isNameServer(hostname) {
+				nsARecord = fmt.Sprintf("%s\t\tIN\tA\t%s ;inaddr", hostname, aRecord.Address.String())
+			}
+		}
+	}
 }
 
 // Generate reverse zone file
-func mkarpa(out *os.File, inputNames []string) {
-
-	host, err := os.Hostname()
+func generateReverseZone(out *os.File, inputNames []string, sortByAddress bool) {
+	hostname, err := os.Hostname()
 	if err != nil {
-		host = "<unknown>"
+		hostname = "<unknown>"
 	}
 
+	// Print header
 	fmt.Fprintln(out, ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
 	fmt.Fprintf(out, "; Reverse zone file for domain '%s'\n", soa.domain)
 	fmt.Fprintf(out, ";\n")
@@ -399,55 +349,104 @@ func mkarpa(out *os.File, inputNames []string) {
 	fmt.Fprintf(out, ";\n")
 	fmt.Fprintf(out, "; Generated %s from:\n", time.Now().Format(time.UnixDate))
 	for _, input := range inputNames {
-		input, _ = filepath.Abs(input)
-		fmt.Fprintf(out, ";  %s:%s\n", host, input)
+		absPath, _ := filepath.Abs(input)
+		fmt.Fprintf(out, ";  %s:%s\n", hostname, absPath)
 	}
 	fmt.Fprintln(out, ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
-	fmt.Fprintf(out, "%s\n", ttl)
-	fmt.Fprintf(out, soa.String())
 
-	if NS_A_RR != "" {
-		fmt.Fprintf(out, "\n%s\n\n", NS_A_RR)
+	// Print TTL
+	fmt.Fprintf(out, "%s\n", ttl)
+
+	// Print SOA
+	fmt.Fprint(out, formatSOA())
+
+	// Print nameserver A record if needed
+	if nsARecord != "" {
+		fmt.Fprintf(out, "\n%s\n\n", nsARecord)
 	}
 
+	// Print custom origin if specified
 	if domain != "" {
 		fmt.Fprintf(out, "\n$ORIGIN %s\n\n", domain)
 	}
 
-	for e := zone.Front(); e != nil; e = e.Next() {
-		fmt.Fprintln(out, e.Value)
+	// Get reverse zone origins in the correct order
+	var origins []string
+	if sortByAddress {
+		origins = getSortedOrigins()
+	} else {
+		// Preserve input order from zone creation
+		origins = reverseZoneOrder
+	}
+
+	// Output each reverse zone with its $ORIGIN directive
+	for _, origin := range origins {
+		reverseZone := reverseZones[origin]
+
+		// Print any comments for this zone
+		for _, comment := range reverseZone.comments {
+			fmt.Fprintf(out, "%s\n", comment)
+		}
+
+		// Print the $ORIGIN directive
+		fmt.Fprintf(out, "$ORIGIN %s\n", origin)
+
+		// Sort records by last octet for consistent output
+		sort.Slice(reverseZone.records, func(i, j int) bool {
+			octI, _ := strconv.Atoi(reverseZone.records[i].lastOctet)
+			octJ, _ := strconv.Atoi(reverseZone.records[j].lastOctet)
+			return octI < octJ
+		})
+
+		// Print PTR records
+		for _, record := range reverseZone.records {
+			fmt.Fprintf(out, "%s\t\tIN\tPTR\t\t%s\n", record.lastOctet, record.hostname)
+		}
+
+		// Print GENERATE directives for this zone
+		for _, generate := range reverseZone.generates {
+			fmt.Fprintf(out, "%s\n", generate)
+		}
 	}
 }
 
 func main() {
-
 	outputFile := flag.String("o", "", "The output file (optional)")
 	revDomain := flag.String("d", "", "Reverse Domain (optional)")
+	sortByAddress := flag.Bool("s", false, "Sort reverse zones by IP address numerically")
 	help := flag.Bool("h", false, "Show help")
 
 	flag.Parse()
 	args := flag.Args()
 
 	if len(args) < 1 || *help {
-		fmt.Println("Usage: mkarpa [-o <output file>] [-d <reverse_domain>] <input file> [<input file> ... ]")
-		fmt.Println("Generate a reverse zone file from one or more forward zone files")
+		fmt.Println("Usage: mkarpa3 [-o <output file>] [-d <reverse_domain>] [-s] <input file> [<input file> ... ]")
+		fmt.Println("Generate a reverse zone file from one or more forward zone files using zoneparser library")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	domain = *revDomain
 
-	// Process all the inputs
-	zone = list.New()
+	// Initialize
+	reverseZones = make(map[string]*reverseZone)
+	reverseZoneOrder = make([]string, 0)
+	currentIncludeFile = ""
+	includeFileCommentAdded = false
+	soa = soaInfo{nameservers: make([]string, 0)}
+
+	// Process all input files
 	for _, inputFile := range args {
-		parseZone(inputFile)
+		if err := parseZoneFile(inputFile); err != nil {
+			fmt.Printf("Error processing file %s: %v\n", inputFile, err)
+			os.Exit(1)
+		}
 	}
 
 	// Generate output
 	var outFile *os.File = os.Stdout
 	var err error
 	if *outputFile != "" {
-		// Output to the specified file
 		outFile, err = os.Create(*outputFile)
 		if err != nil {
 			fmt.Printf("Error creating output file: %v\n", err)
@@ -456,5 +455,28 @@ func main() {
 		defer outFile.Close()
 	}
 
-	mkarpa(outFile, args)
+	generateReverseZone(outFile, args, *sortByAddress)
+}
+
+// getSortedOrigins returns reverse zone origins sorted numerically by IP address
+func getSortedOrigins() []string {
+	var origins []string
+	for origin := range reverseZones {
+		origins = append(origins, origin)
+	}
+	sort.Slice(origins, func(i, j int) bool {
+		// Extract first octet from origins like "0.254.10.in-addr.arpa."
+		partsI := strings.Split(origins[i], ".")
+		partsJ := strings.Split(origins[j], ".")
+		if len(partsI) >= 1 && len(partsJ) >= 1 {
+			octI, errI := strconv.Atoi(partsI[0])
+			octJ, errJ := strconv.Atoi(partsJ[0])
+			if errI == nil && errJ == nil {
+				return octI < octJ
+			}
+		}
+		// Fallback to alphabetical if parsing fails
+		return origins[i] < origins[j]
+	})
+	return origins
 }

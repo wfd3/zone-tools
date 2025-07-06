@@ -1,0 +1,9 @@
+; Services file to be included
+www	IN	A	192.168.20.1
+www	IN	AAAA	2001:db8:20::1
+
+mail	IN	A	192.168.20.2
+@	IN	MX	10 mail.include.example.
+
+ftp	IN	A	192.168.20.3
+ftp	IN	TXT	"FTP Server"

@@ -1,17 +1,32 @@
 package main
 
-// Generate reverse zone files from one or more forward zones
+//
+// mkkea3 - Generate Kea DHCP reservations from DNS zone files
+//
+// mkkea3 extracts Kea DHCP reservation data from DNS zone files and outputs
+// them in JSON format suitable for inclusion in Kea DHCP server configuration.
+//
+// The program looks for TXT records with the prefix "kea:" followed by
+// key-value pairs. Currently supported Kea directives are:
+//  - hw-address: MAC address for the reservation
+//  - client-classes: Array of client classes (e.g., [kids, test])
+//
+// Only A records without the ";inaddr" comment are processed, as inaddr
+// records are intended for reverse DNS generation, not DHCP reservations.
+//
 
 import (
-	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"os"
-	"regexp"
+	"sort"
 	"strings"
 	"time"
+
+	"zone-tools/zoneparser"
 )
 
 const KEA_PREFIX = "kea:"
@@ -22,35 +37,21 @@ var supportedKeys = map[string]bool{
 	"client-classes": true,
 }
 
-// Regular expressions
-var extractQuotes = regexp.MustCompile(`"((?:\\.|[^"\\])*)"`)
-var commentToEndOfLine = regexp.MustCompile(`;.*`)
+var filterNetwork *net.IPNet
+
+// KeaReservation represents a single Kea DHCP reservation
+type KeaReservation struct {
+	Hostname  string
+	IPAddress string
+	KeaData   map[string]string
+}
+
+// Comparison function type
+type CompareFunc func(i, j KeaReservation) bool
 
 //
 // helper functions
 //
-
-func trimQuotes(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
-}
-
-func stripUnquotedComment(s string) string {
-	inQuote := false
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '"':
-			inQuote = !inQuote
-		case ';':
-			if !inQuote {
-				return strings.TrimSpace(s[:i])
-			}
-		}
-	}
-	return s
-}
 
 func unescapeTXT(s string) string {
 	s = strings.ReplaceAll(s, `\\`, `\`)
@@ -71,7 +72,7 @@ func splitOutsideBrackets(s string) []string {
 			if level > 0 {
 				level--
 			} else {
-				panic(fmt.Sprintf("Mismatched closing bracket: %s", s))
+				return nil // Handle mismatched brackets gracefully
 			}
 		case ',':
 			if level == 0 {
@@ -85,6 +86,9 @@ func splitOutsideBrackets(s string) []string {
 	}
 	if start < len(s) {
 		result = append(result, strings.TrimSpace(s[start:]))
+	}
+	if level > 0 {
+		return nil // Unclosed brackets
 	}
 	return result
 }
@@ -113,89 +117,7 @@ func quoteCSVList(bracketed string) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-func readLogicalLine(r *bufio.Reader, line *uint32) (string, error) {
-	var result string
-	var insideParens bool
-
-	for {
-		*line++
-		s, err := r.ReadString('\n')
-		if err != nil && err != io.EOF {
-			return "", err
-		}
-
-		s = strings.TrimRight(s, "\r\n")
-		//s = commentToEndOfLine.ReplaceAllString(s, "") // remove ; comments
-		s = stripUnquotedComment(s) // remove ; comments
-		s = strings.TrimSpace(s)
-
-		if s == "" {
-			if err == io.EOF {
-				break
-			}
-			continue
-		}
-
-		// Append to result
-		if result != "" {
-			result += " "
-		}
-		result += s
-
-		// Handle parentheses
-		insideParens = strings.Contains(result, "(") && !strings.Contains(result, ")")
-
-		if !insideParens || strings.Contains(result, ")") {
-			break
-		}
-
-		if err == io.EOF {
-			break
-		}
-	}
-	return result, nil
-}
-
-func parseARecord(line string) (hostname string, ip string, ok bool) {
-	fields := strings.Fields(line)
-	if len(fields) >= 4 &&
-		strings.ToUpper(fields[1]) == "IN" &&
-		strings.ToUpper(fields[2]) == "A" {
-		return fields[0], fields[3], true
-	}
-	return "", "", false
-}
-
-func parseTXTLine(line string) (name string, txt string, ok bool, err error) {
-	// txtRecord matches a TXT RR with optional parens and one or more quoted strings.
-	// It captures an optional hostname and the full quoted payload (e.g. "foo" "bar").
-	// Allows lines like: name IN TXT ("str1" "str2") or name IN TXT "str1"
-	txtRecord := regexp.MustCompile(`(?i)^\s*(?:(\S+)\s+)?IN\s+TXT\s+\(?\s*((?:"(?:\\.|[^"\\])*"\s*)+)\s*\)?$`)
-
-	matches := txtRecord.FindStringSubmatch(line)
-	if matches == nil {
-		return "", "", false, nil // Not a TXT record
-	}
-	name = matches[1]
-	raw := matches[2]
-
-	segments := extractQuotes.FindAllStringSubmatch(raw, -1)
-	if segments == nil {
-		return "", "", false, fmt.Errorf("no quoted segments found in TXT record: %q", line)
-	}
-
-	for _, s := range segments {
-		txt += unescapeTXT(trimQuotes(strings.TrimSpace(s[1])))
-		txt += " "
-	}
-	txt = strings.TrimSpace(txt)
-	return name, txt, true, nil
-}
-
 func parseKeaRecords(txt string) (map[string]string, bool, error) {
-
-	// Join multiple lines with ", " and trim quotes/space
-
 	// Is this a KEA-tagged TXT record?
 	if !strings.HasPrefix(txt, KEA_PREFIX) {
 		return map[string]string{}, false, nil
@@ -211,7 +133,6 @@ func parseKeaRecords(txt string) (map[string]string, bool, error) {
 	ok := false
 	result := make(map[string]string)
 	for _, pair := range pairs {
-
 		kv := strings.SplitN(pair, " ", 2)
 		if len(kv) != 2 {
 			return map[string]string{}, false, nil
@@ -219,7 +140,7 @@ func parseKeaRecords(txt string) (map[string]string, bool, error) {
 		key := strings.TrimSpace(kv[0])
 		value := strings.TrimSpace(kv[1])
 		if !supportedKeys[key] {
-			return nil, false, fmt.Errorf("Unknown KEA directive '%s'", key)
+			return nil, false, fmt.Errorf("unknown KEA directive '%s'", key)
 		}
 
 		if key == "client-classes" {
@@ -238,149 +159,236 @@ func parseKeaRecords(txt string) (map[string]string, bool, error) {
 	return result, ok, nil
 }
 
-func isKeaTXTRecord(line string, host string) (map[string]string, bool, error) {
-	// Check if the line is a TXT record
-	name, txt, ok, err := parseTXTLine(line)
-	if err != nil || !ok {
-		return nil, false, err
+// isValidIP checks if an IP address is in the configured network filter
+func isValidIP(ipStr string) bool {
+	if filterNetwork == nil {
+		return true
 	}
-
-	// Check if the TXT record contains Kea records
-	kearecords, ok, err := parseKeaRecords(txt)
-	if !ok {
-		return nil, false, err
-	}
-
-	// The TXT record contained valid Kea records, make sure we have a good hostname
-	if host == "" && name == "" {
-		return nil, false, fmt.Errorf("No hostname found")
-	}
-	if host != name && name != "" {
-		return nil, false, fmt.Errorf("Hostname mismatch: %s != %s", name, host)
-	}
-
-	return kearecords, true, nil
+	ip := net.ParseIP(ipStr)
+	return ip != nil && filterNetwork.Contains(ip)
 }
 
-// Zonefile parsing
-func parseZone(inputFile string, out *os.File) bool {
-	var line uint32
-	var needComma bool = false
-	var emittedHeader bool = false
-	var host string = ""
-	var ip string = ""
+// normalizeMACAddress converts a MAC address string to a comparable format
+// Handles different formats like "aa:bb:cc:dd:ee:ff", "aa-bb-cc-dd-ee-ff", etc.
+func normalizeMACAddress(mac string) string {
+	// Remove common separators and convert to lowercase
+	normalized := strings.ToLower(mac)
+	normalized = strings.ReplaceAll(normalized, ":", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	normalized = strings.ReplaceAll(normalized, ".", "")
+	normalized = strings.ReplaceAll(normalized, " ", "")
+	return normalized
+}
 
-	in, err := os.Open(inputFile)
+// parseZone parses a zone file using the new parser and returns Kea reservations
+func parseZone(inputFile string) ([]KeaReservation, error) {
+	var reservations []KeaReservation
+
+	// Create parser and parse the file
+	parser := zoneparser.NewParser(inputFile)
+	zone, _, err := parser.Parse()
 	if err != nil {
-		log.Fatalf("Error opening input file: %v\n", err)
+		return nil, fmt.Errorf("error parsing zone file %s: %v", inputFile, err)
 	}
-	defer in.Close()
 
-	r := bufio.NewReader(in)
-
-	for {
-		s, err := readLogicalLine(r, &line)
-		if s == "" && err == nil {
-			break
-		}
-
-		s = strings.TrimSpace(s)
-
-		if s == "" || strings.HasPrefix(s, ";") || strings.HasPrefix(s, "\n") || strings.HasPrefix(s, "$ORIGIN") {
+	// Process each entry in the zone
+	for _, entry := range zone {
+		// We only care about host records
+		if entry.Type != zoneparser.EntryTypeRecord {
 			continue
 		}
 
-		// Looking at a complete A RR "host IN A 1.2.3.4"?
-		name, addr, ok := parseARecord(s)
-		if ok {
-			host = name
-			ip = addr
-			continue // Go to next line
+		hostRecord := entry.HostRecord
+		hostname := hostRecord.Hostname
+
+		// Find first valid A record (not inaddr, in network)
+		validIP := findValidIP(hostRecord.Records.A)
+		if validIP == "" {
+			continue
 		}
 
-		// Looking at a complete TXT RR w/ Kea records?
-		keaRecords, ok, err := isKeaTXTRecord(s, host)
-		if err != nil {
-			log.Fatalf("\nError at line %d: %v", line, err)
-		}
-		if !ok {
-			continue // Not a TXT record
-		}
-
-		recordLen := len(keaRecords)
-
-		// We have a valid Kea record, so let's format it
-		if !emittedHeader {
-			fmt.Fprintf(out, "// Generated by %s\n", os.Args[0])
-			fmt.Fprintf(out, "// This file is auto-generated. Do not edit.\n")
-			fmt.Fprintf(out, "//\n")
-			fmt.Fprintf(out, "// Generated on %s\n", time.Now().Format(time.RFC1123))
-			fmt.Fprintf(out, "// Input file: %s\n", inputFile)
-			fmt.Fprintf(out, "//\n")
-			fmt.Fprintf(out, "\n")
-			emittedHeader = true
-		}
-
-		if needComma {
-			fmt.Fprintf(out, ",\n")
-		}
-		needComma = true
-
-		fmt.Fprintf(out, "{\n")
-		fmt.Fprintf(out, "    \"hostname\": \"%s\",\n", host)
-		fmt.Fprintf(out, "    \"ip-address\": \"%s\",\n", ip)
-		count := 0
-		for key, value := range keaRecords {
-			count++
-			isLast := count == recordLen
-			needsQuote := !strings.HasPrefix(value, "[")
-			fmt.Fprintf(out, "    \"%s\": ", key)
-			if needsQuote {
-				fmt.Fprint(out, "\"")
+		// Process TXT records for Kea data
+		for _, txtRecord := range hostRecord.Records.TXT {
+			txt := unescapeTXT(txtRecord.Text)
+			keaRecords, ok, err := parseKeaRecords(txt)
+			if err != nil {
+				return nil, fmt.Errorf("error processing TXT record for %s: %v", hostname, err)
 			}
-			fmt.Fprintf(out, "%s", value)
+			if !ok {
+				continue // Not a Kea TXT record
+			}
+
+			// Create reservation
+			reservation := KeaReservation{
+				Hostname:  hostname,
+				IPAddress: validIP,
+				KeaData:   keaRecords,
+			}
+			reservations = append(reservations, reservation)
+		}
+	}
+
+	return reservations, nil
+}
+
+// findValidIP returns the first valid IP from A records (not inaddr, in network)
+func findValidIP(aRecords []zoneparser.ARecord) string {
+	for _, aRecord := range aRecords {
+		if aRecord.Inaddr {
+			continue // Skip reverse DNS records
+		}
+		if ip := aRecord.Address.String(); isValidIP(ip) {
+			return ip
+		}
+	}
+	return ""
+}
+
+func writeKea(outFile *os.File, allReservations []KeaReservation, files []string, networkFilter string) {
+	if len(allReservations) == 0 {
+		return
+	}
+
+	fmt.Fprintf(outFile, "// Generated by %s\n", os.Args[0])
+	fmt.Fprintf(outFile, "// This file is auto-generated. Do not edit.\n")
+	fmt.Fprintf(outFile, "//\n")
+	fmt.Fprintf(outFile, "// Generated on %s\n", time.Now().Format(time.RFC1123))
+	fmt.Fprintf(outFile, "// Input files: %s\n", strings.Join(files, ", "))
+	if networkFilter != "" {
+		fmt.Fprintf(outFile, "//\n")
+		fmt.Fprintf(outFile, "// Network: %s\n", networkFilter)
+	}
+	fmt.Fprintf(outFile, "//\n")
+	fmt.Fprintf(outFile, "\n")
+
+	for i, reservation := range allReservations {
+		if i > 0 {
+			fmt.Fprintf(outFile, ",\n")
+		}
+
+		fmt.Fprintf(outFile, "{\n")
+		fmt.Fprintf(outFile, "    \"hostname\": \"%s\",\n", reservation.Hostname)
+		fmt.Fprintf(outFile, "    \"ip-address\": \"%s\",\n", reservation.IPAddress)
+
+		// Sort keys for consistent output
+		keys := make([]string, 0, len(reservation.KeaData))
+		for key := range reservation.KeaData {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		for i, key := range keys {
+			value := reservation.KeaData[key]
+			isLast := i == len(keys)-1
+			needsQuote := !strings.HasPrefix(value, "[")
+			fmt.Fprintf(outFile, "    \"%s\": ", key)
 			if needsQuote {
-				fmt.Fprint(out, "\"")
+				fmt.Fprint(outFile, "\"")
+			}
+			fmt.Fprintf(outFile, "%s", value)
+			if needsQuote {
+				fmt.Fprint(outFile, "\"")
 			}
 
 			if !isLast {
-				fmt.Fprintf(out, ",")
+				fmt.Fprintf(outFile, ",")
 			}
-			fmt.Fprintf(out, "\n")
+			fmt.Fprintf(outFile, "\n")
 		}
-		fmt.Fprintf(out, "}")
-
-		// Reset for the next record
-		host = ""
-		ip = ""
+		fmt.Fprintf(outFile, "}")
 	}
-	fmt.Fprintf(out, "\n")
+	fmt.Fprintf(outFile, "\n")
+}
 
-	return emittedHeader // Did we emit something?
+// Individual comparator functions
+func compareByHostname(i, j KeaReservation) bool {
+	return i.Hostname < j.Hostname
+}
+
+func compareByIP(i, j KeaReservation) bool {
+	ipA := net.ParseIP(i.IPAddress)
+	ipB := net.ParseIP(j.IPAddress)
+	return bytes.Compare(ipA, ipB) < 0
+}
+
+func compareByMAC(i, j KeaReservation) bool {
+	macA := i.KeaData["hw-address"]
+	macB := j.KeaData["hw-address"]
+	if macA == "" && macB == "" {
+		return false
+	}
+	if macA == "" {
+		return true
+	}
+	if macB == "" {
+		return false
+	}
+	return normalizeMACAddress(macA) < normalizeMACAddress(macB)
+}
+
+// Simplified sort function
+func sortReservations(allReservations []KeaReservation, compareFunc CompareFunc) []KeaReservation {
+	if len(allReservations) > 0 && compareFunc != nil {
+		sort.Slice(allReservations, func(i, j int) bool {
+			return compareFunc(allReservations[i], allReservations[j])
+		})
+	}
+	return allReservations
 }
 
 func main() {
-
 	log.SetFlags(0)
 	outputFile := flag.String("o", "", "The output file (optional)")
 	stop := flag.Bool("s", false, "Stop if no Kea records found in input")
+	sortByHostname := flag.Bool("H", false, "Sort output by hostname")
+	sortByIP := flag.Bool("I", false, "Sort output by IP address")
+	sortByMAC := flag.Bool("M", false, "Sort output by MAC address")
+	networkFilter := flag.String("n", "", "Limit output to specified network in CIDR format (e.g., 192.168.1.0/24)")
 	help := flag.Bool("h", false, "Show help")
 
 	flag.Parse()
 	args := flag.Args()
 
 	if len(args) < 1 || *help {
-		fmt.Println("Usage: mkarpa [-o <output file>] <input file> [<input file> ... ]")
+		fmt.Println("Usage: mkkea3 [-o <output file>] [-s] [-H|-I|-M] [-n <network_cidr>] <input file> [<input file> ... ]")
 		fmt.Println("Extract and format the contents of a Kea 'reservations' stanza from a BIND Zone file.")
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
 
-	// Generate output
+	// Validate that only one sort option is specified
+	sortFlags := 0
+	var compareFunc CompareFunc
+
+	if *sortByHostname {
+		compareFunc = compareByHostname
+		sortFlags++
+	}
+	if *sortByIP {
+		compareFunc = compareByIP
+		sortFlags++
+	}
+	if *sortByMAC {
+		compareFunc = compareByMAC
+		sortFlags++
+	}
+	if sortFlags > 1 {
+		log.Fatalf("Only one sort option can be specified (-H, -I, or -M)")
+	}
+
+	// Parse network filter if provided
+	if *networkFilter != "" {
+		var err error
+		_, filterNetwork, err = net.ParseCIDR(*networkFilter)
+		if err != nil {
+			log.Fatalf("Error parsing network CIDR: %v\n", err)
+		}
+	}
+
+	// Setup output file
 	var outFile *os.File = os.Stdout
 	var err error
 	if *outputFile != "" {
-		// Output to the specified file
 		outFile, err = os.Create(*outputFile)
 		if err != nil {
 			log.Fatalf("Error creating output file: %v\n", err)
@@ -388,16 +396,25 @@ func main() {
 		defer outFile.Close()
 	}
 
-	// Process all the inputs
-	var foundKeaRecords bool = false
+	// Process all the inputs and collect reservations
+	var allReservations []KeaReservation
 	for _, inputFile := range args {
-		foundKeaRecords = foundKeaRecords || parseZone(inputFile, outFile)
+		reservations, err := parseZone(inputFile)
+		if err != nil {
+			log.Fatalf("Error processing %s: %v", inputFile, err)
+		}
+		allReservations = append(allReservations, reservations...)
 	}
-	if !foundKeaRecords {
+
+	allReservations = sortReservations(allReservations, compareFunc)
+
+	// Output results
+	if len(allReservations) == 0 {
+		fmt.Println("No Kea records found in input files")
 		if *stop {
-			log.Fatalf("No Kea records found in input files")
-		} else {
-			fmt.Println("No Kea records found in input files")
+			log.Fatal("Exiting")
 		}
 	}
+
+	writeKea(outFile, allReservations, args, *networkFilter)
 }

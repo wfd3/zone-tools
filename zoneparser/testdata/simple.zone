@@ -1,0 +1,23 @@
+; Simple test zone file
+$TTL 3600
+$ORIGIN test.example.
+
+@	IN	SOA	ns1.test.example. admin.test.example. (
+		2023010101	; Serial
+		3600		; Refresh
+		1800		; Retry
+		604800		; Expire
+		86400 )		; Minimum TTL
+
+@	IN	NS	ns1.test.example.
+@	IN	NS	ns2.test.example.
+@	IN	A	192.168.1.1
+@	IN	AAAA	2001:db8::1
+
+www	IN	A	192.168.1.2
+www	IN	AAAA	2001:db8::2
+
+mail	IN	A	192.168.1.3
+@	IN	MX	10 mail.test.example.
+
+ftp	IN	CNAME	www.test.example.

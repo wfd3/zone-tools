@@ -1,0 +1,28 @@
+; Test zone with GENERATE directives
+$TTL 3600
+$ORIGIN generate.example.
+
+@	IN	SOA	ns1.generate.example. admin.generate.example. (
+		2023010301	; Serial
+		3600		; Refresh
+		1800		; Retry
+		604800		; Expire
+		86400 )		; Minimum TTL
+
+@	IN	NS	ns1.generate.example.
+
+; Generate host records for DHCP range
+$GENERATE 1-10 dhcp-$ IN A 192.168.1.$
+
+; Generate with offset and padding
+$GENERATE 1-5 host${100,3,d} IN A 10.0.1.$
+
+; Generate with hex format
+$GENERATE 1-3 hex${0,2,x} IN A 172.16.1.$
+
+; Generate PTR records
+$GENERATE 1-10 $.1.168.192.in-addr.arpa. IN PTR dhcp-$.generate.example.
+
+; Static records mixed in
+static1	IN	A	192.168.1.100
+static2	IN	A	192.168.1.200

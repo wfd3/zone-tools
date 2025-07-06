@@ -1,0 +1,28 @@
+; Zone file with various errors for testing error handling
+$TTL 3600
+$ORIGIN errors.example.
+
+@	IN	SOA	ns1.errors.example. admin.errors.example. (
+		2023010501	; Serial
+		3600		; Refresh
+		1800		; Retry
+		604800		; Expire
+		86400 )		; Minimum TTL
+
+; Valid record
+valid	IN	A	192.168.1.1
+
+; Invalid A record (bad IP)
+bad-ip	IN	A	999.999.999.999
+
+; Incomplete MX record
+incomplete	IN	MX	10
+
+; Invalid TTL
+invalid-ttl	999999999999999999	IN	A	192.168.1.2
+
+; Missing record type
+missing-type	IN	192.168.1.3
+
+; Unknown record type
+unknown	IN	UNKNOWN	somedata

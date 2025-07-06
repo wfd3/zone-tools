@@ -1,15 +1,35 @@
 package main
 
+//
+// dhcpgen - Generate DNS $GENERATE directives for DHCP host ranges
+//
+// This program creates DNS $GENERATE directives for bulk DHCP host creation across
+// IP address ranges. It automatically handles Class C network boundaries, skips
+// reserved addresses (.0 and .255), and provides sequential host numbering.
+//
+// Usage:
+//   dhcpgen [-options] start_ip end_ip
+//
+// Example:
+//   dhcpgen -comments -hoststart 100 -hostname guest 10.1.50.10 10.1.51.20
+//
+
 import (
 	"bytes"
 	"flag"
 	"fmt"
-	"math"
 	"net"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+)
+
+// Network constants
+const (
+	ClassCNetworkMask = 0xFFFFFF00
+	MaxHostInNetwork  = 0xFE // x.x.x.254 max
+	LastOctetMask     = 0xFF
 )
 
 func ipToUint32(ip net.IP) uint32 {
@@ -31,13 +51,11 @@ func isValidDNSDomain(domain string) bool {
 	return dnsRegex.MatchString(domain)
 }
 
-func computeFieldWidth(maxValue int) int {
+func getFieldWidth(maxValue int) int {
 	if maxValue == 0 {
 		return 1
 	}
-
-	absValue := int(math.Abs(float64(maxValue)))
-	return len(strconv.Itoa(absValue))
+	return len(strconv.Itoa(maxValue))
 }
 
 func fqdn(host, domain string) string {
@@ -57,107 +75,197 @@ func fqdn(host, domain string) string {
 	return fqdn
 }
 
-func countClassCNetworks(startIP, endIP uint32) int {
+// countValidHosts counts usable host addresses in the range (excludes .0 and .255)
+func countValidHosts(startIP, endIP uint32) int {
 	if startIP > endIP {
 		return 0
 	}
 
-	startNetwork := startIP & 0xFFFFFF00
-	endNetwork := endIP & 0xFFFFFF00
-	networkDiff := endNetwork - startNetwork
-
-	numNetworks := int(networkDiff >> 8)
-
-	// Account for the possibility of a single extra network in the last byte
-	if (startIP&0xFF) != 0 && (endIP&0xFF) == 255 {
-		numNetworks++
+	count := 0
+	for ip := startIP; ip <= endIP; ip++ {
+		octet := int(ip & LastOctetMask)
+		if octet != 0 && octet != 255 {
+			count++
+		}
 	}
-
-	return numNetworks
+	return count
 }
 
-func hostPatternFormat(host, domain string, offset, width int) string {
+func makeHostPattern(host, domain string, offset, width int) string {
 	s := fmt.Sprintf("%s-${%d,%d,d}", host, offset, width)
 	return fqdn(s, domain)
 }
 
-func hostNameFormat(host string, width, offset int) string {
+func makeHostName(host string, width, offset int) string {
 	return fmt.Sprintf("%s-%0*d", host, width, offset)
 }
 
-func calculateNetworkEnd(currentIP uint32, endIP uint32) uint32 {
-	networkEnd := currentIP&0xFFFFFF00 | 0xFE // x.x.x.254 max
-	return min(networkEnd, endIP)
+// network represents a Class C network for generation
+type network struct {
+	baseIP     uint32 // Network base (e.g., 10.1.1.0)
+	startOctet int    // Starting octet in this network
+	endOctet   int    // Ending octet in this network
+	hostStart  int    // Starting host number
 }
 
-func generateGenerateStatements(startIP, endIP string, hostStart int, hostName string, origin string, comments bool, mx string, mx_pri uint) ([]string, error) {
+// generateForNetwork creates $GENERATE statements for a single network
+func generateForNetwork(net network, hostName, origin string, width int, comments bool, mx string, mxPri uint) []string {
+	var statements []string
+
+	// Create IP pattern (e.g., "10.1.1.$")
+	baseIP := uint32ToIP(net.baseIP)
+	parts := strings.Split(baseIP.String(), ".")
+	ipPattern := fmt.Sprintf("%s.%s.%s.$", parts[0], parts[1], parts[2])
+
+	// Count valid hosts for comments
+	validHosts := 0
+	for octet := net.startOctet; octet <= net.endOctet; octet++ {
+		if octet != 0 && octet != 255 {
+			validHosts++
+		}
+	}
+
+	// Add comment if requested
+	if comments && validHosts > 0 {
+		startIP := fmt.Sprintf("%s.%s.%s.%d", parts[0], parts[1], parts[2], net.startOctet)
+		endIP := fmt.Sprintf("%s.%s.%s.%d", parts[0], parts[1], parts[2], net.endOctet)
+		startHost := makeHostName(hostName, width, net.hostStart)
+		endHost := makeHostName(hostName, width, net.hostStart+validHosts-1)
+		comment := fmt.Sprintf("\n; %s-%s => %s to %s, %d hosts",
+			startIP, endIP, startHost, endHost, validHosts)
+		statements = append(statements, comment)
+	}
+
+	// Generate $GENERATE statements, skipping .0 and .255
+	hostOffset := net.hostStart
+	for octet := net.startOctet; octet <= net.endOctet; octet++ {
+		if octet == 0 || octet == 255 {
+			continue // Skip reserved addresses
+		}
+
+		// Find continuous range of valid octets
+		rangeStart := octet
+		for octet <= net.endOctet && octet != 0 && octet != 255 {
+			octet++
+		}
+		rangeEnd := octet - 1
+
+		// Generate A record
+		aRecord := fmt.Sprintf("$GENERATE %d-%d %s IN A %s",
+			rangeStart, rangeEnd,
+			makeHostPattern(hostName, origin, hostOffset, width),
+			ipPattern)
+		statements = append(statements, aRecord)
+
+		// Generate MX record if specified
+		if mx != "" {
+			mxRecord := fmt.Sprintf("$GENERATE %d-%d %s IN MX \"%d %s\"",
+				rangeStart, rangeEnd,
+				makeHostPattern(hostName, origin, hostOffset, width),
+				mxPri, fqdn(mx, origin))
+			statements = append(statements, mxRecord)
+		}
+
+		// Update host offset
+		hostOffset += (rangeEnd - rangeStart + 1)
+		octet-- // Adjust for outer loop increment
+	}
+
+	return statements
+}
+
+// getNetworksInRange splits IP range into Class C networks
+func getNetworksInRange(startIP, endIP uint32, hostStart int) []network {
+	var networks []network
+	current := startIP
+	hostOffset := hostStart
+
+	for current <= endIP {
+		// Get network base (e.g., 10.1.1.0)
+		networkBase := current & ClassCNetworkMask
+
+		// Find range within this network
+		startOctet := int(current & LastOctetMask)
+		networkEnd := min(networkBase|255, endIP)
+		endOctet := int(networkEnd & LastOctetMask)
+
+		// Count valid hosts in this network
+		validHosts := 0
+		for octet := startOctet; octet <= endOctet; octet++ {
+			if octet != 0 && octet != 255 {
+				validHosts++
+			}
+		}
+
+		// Add network if it has valid hosts
+		if validHosts > 0 {
+			networks = append(networks, network{
+				baseIP:     networkBase,
+				startOctet: startOctet,
+				endOctet:   endOctet,
+				hostStart:  hostOffset,
+			})
+			hostOffset += validHosts
+		}
+
+		// Move to next Class C network
+		current = ((networkBase >> 8) + 1) << 8
+	}
+
+	return networks
+}
+
+// validateIPRange validates the IP range inputs
+func validateIPRange(startIP, endIP string) (uint32, uint32, error) {
 	start := net.ParseIP(startIP)
 	if start == nil {
-		return nil, fmt.Errorf("invalid start IP address: %s", startIP)
+		return 0, 0, fmt.Errorf("invalid start IP address: %s", startIP)
 	}
 
 	end := net.ParseIP(endIP)
 	if end == nil {
-		return nil, fmt.Errorf("invalid end IP address: %s", endIP)
+		return 0, 0, fmt.Errorf("invalid end IP address: %s", endIP)
 	}
 
 	if bytes.Compare(start, end) > 0 {
-		return nil, fmt.Errorf("start IP must be less than or equal to end IP")
+		return 0, 0, fmt.Errorf("start IP must be less than or equal to end IP")
 	}
 
-	startUint := ipToUint32(start)
-	endUint := ipToUint32(end)
+	return ipToUint32(start), ipToUint32(end), nil
+}
 
-	totalHosts := int(endUint) - int(startUint) - countClassCNetworks(startUint, endUint)
-	width := computeFieldWidth(totalHosts)
+func generateStatements(startIP, endIP string, hostStart int, hostName string, origin string, comments bool, mx string, mxPri uint) ([]string, error) {
+	// Validate inputs
+	startUint, endUint, err := validateIPRange(startIP, endIP)
+	if err != nil {
+		return nil, err
+	}
+	if hostStart < 0 {
+		return nil, fmt.Errorf("hostStart cannot be negative: %d", hostStart)
+	}
+
+	// Count total valid hosts and calculate field width
+	totalHosts := countValidHosts(startUint, endUint)
+	if totalHosts == 0 {
+		return nil, fmt.Errorf("no valid host addresses in range %s to %s", startIP, endIP)
+	}
+	maxHostNumber := hostStart + totalHosts - 1
+	width := getFieldWidth(maxHostNumber)
 
 	var statements []string
-	var offset int = 0
 
+	// Add header comment
 	if comments {
-		statements = append(statements,
-			fmt.Sprintf("; Creating $GENERATE directives for addresses %s through %s\n; %d hosts total", startIP, endIP, totalHosts))
+		header := fmt.Sprintf("; Creating $GENERATE directives for addresses %s through %s\n; %d hosts total, starting from host %d",
+			startIP, endIP, totalHosts, hostStart)
+		statements = append(statements, header)
 	}
 
-	var generateStatement string
-	for current := startUint; current <= endUint; {
-		// Determine the end of the current Class C network
-
-		currentNetworkEnd := calculateNetworkEnd(current, endUint)
-		start := int(current & 0xff)
-		end := int(currentNetworkEnd) & 0xff
-
-		if hostStart != 0 {
-			offset = int(hostStart - start)
-		}
-
-		currentIP := uint32ToIP(current)
-		currentIPParts := strings.Split(currentIP.String(), ".")
-		ipPattern := fmt.Sprintf("%s.%s.%s.$", currentIPParts[0], currentIPParts[1], currentIPParts[2])
-
-		generateStatement = ""
-
-		if comments {
-			generateStatement = fmt.Sprintf("\n; %s-%s => %s to %s, %d hosts", currentIP, uint32ToIP(currentNetworkEnd),
-				hostNameFormat(hostName, width, offset), hostNameFormat(hostName, width, offset+end), end-start)
-			statements = append(statements, generateStatement)
-		}
-
-		generateStatement = fmt.Sprintf(";$reverse-domain %s.%s.%s.in-addr.arpa.", currentIPParts[2], currentIPParts[1], currentIPParts[0])
-		statements = append(statements, generateStatement)
-
-		generateStatement = fmt.Sprintf("$GENERATE %d-%d %s IN A %s", start, end, hostPatternFormat(hostName, origin, offset, width), ipPattern)
-		statements = append(statements, generateStatement)
-
-		if mx != "" {
-			generateStatement = fmt.Sprintf("$GENERATE %d-%d %s IN MX \"%d %s\"", start, end, hostPatternFormat(hostName, origin, offset, width),
-				mx_pri, fqdn(mx, origin))
-			statements = append(statements, generateStatement)
-		}
-
-		// Move to the next Class C network & next hostStart
-		current = ((current >> 8) + 1) << 8
-		hostStart = 1 + offset + end
+	// Get networks and generate statements for each
+	networks := getNetworksInRange(startUint, endUint, hostStart)
+	for _, net := range networks {
+		netStatements := generateForNetwork(net, hostName, origin, width, comments, mx, mxPri)
+		statements = append(statements, netStatements...)
 	}
 
 	return statements, nil
@@ -170,7 +278,7 @@ func main() {
 	comments := flag.Bool("comments", false, "Add comments for each $GENERATE directive")
 	outputFile := flag.String("o", "", "Output file (optional)")
 	mx := flag.String("mx", "", "Add MX record (optional)")
-	mx_pri := flag.Uint("mx_priority", 0, "MX priority (optional, default 0)")
+	mxPri := flag.Uint("mx_priority", 0, "MX priority (optional, default 0)")
 	help := flag.Bool("h", false, "Show help")
 
 	flag.Parse()
@@ -194,13 +302,26 @@ func main() {
 	}
 
 	// Validate that the IP addresses are in the correct format
-	if net.ParseIP(startIP) == nil {
+	startIPAddr := net.ParseIP(startIP)
+	if startIPAddr == nil || startIPAddr.To4() == nil {
 		fmt.Println("Error: startIP is not a valid IPv4 address.")
 		os.Exit(1)
 	}
 
-	if net.ParseIP(endIP) == nil {
+	endIPAddr := net.ParseIP(endIP)
+	if endIPAddr == nil || endIPAddr.To4() == nil {
 		fmt.Println("Error: endIP is not a valid IPv4 address.")
+		os.Exit(1)
+	}
+
+	// Additional validation
+	if *hostStart < 0 {
+		fmt.Println("Error: hoststart cannot be negative.")
+		os.Exit(1)
+	}
+
+	if *hostName == "" {
+		fmt.Println("Error: hostname cannot be empty.")
 		os.Exit(1)
 	}
 
@@ -209,7 +330,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	statements, err := generateGenerateStatements(startIP, endIP, *hostStart, *hostName, *origin, *comments, *mx, *mx_pri)
+	statements, err := generateStatements(startIP, endIP, *hostStart, *hostName, *origin, *comments, *mx, *mxPri)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return

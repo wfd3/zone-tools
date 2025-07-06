@@ -1,0 +1,192 @@
+.TH DHCPGEN 1 "July 2025" "zone-tools" "User Commands"
+.SH NAME
+dhcpgen \- generate DNS $GENERATE directives for DHCP host ranges
+.SH SYNOPSIS
+.B dhcpgen
+[\fB\-hoststart\fR \fIN\fR]
+[\fB\-hostname\fR \fIprefix\fR]
+[\fB\-origin\fR \fIdomain\fR]
+[\fB\-mx\fR \fIhost\fR]
+[\fB\-mx_priority\fR \fIN\fR]
+[\fB\-comments\fR]
+[\fB\-o\fR \fIoutput\fR]
+[\fB\-h\fR]
+\fIstart_ip\fR \fIend_ip\fR
+.SH DESCRIPTION
+.B dhcpgen
+creates DNS $GENERATE directives for bulk DHCP host creation across IP address ranges.
+The program automatically handles Class C network boundaries, skips reserved addresses
+(.0 and .255), and provides sequential host numbering.
+
+The tool is designed for creating large numbers of DNS entries for DHCP pools,
+automatically generating the appropriate $GENERATE directives that can be included
+in DNS zone files.
+
+.SH OPTIONS
+.TP
+.BR \-hoststart " " \fIN\fR
+Starting host number for sequential numbering. Default is 0.
+Host numbers increment sequentially across the entire IP range.
+.TP
+.BR \-hostname " " \fIprefix\fR
+Hostname prefix for generated hosts. Default is "dhcp".
+Generated hostnames will be prefix-N where N is the sequential host number.
+.TP
+.BR \-origin " " \fIdomain\fR
+DNS domain to append to hostnames. If specified, hostnames become fully qualified.
+.TP
+.BR \-mx " " \fIhost\fR
+Add MX record generation for each host pointing to the specified mail server.
+.TP
+.BR \-mx_priority " " \fIN\fR
+MX record priority when \fB\-mx\fR is specified. Default is 0.
+.TP
+.BR \-comments
+Add detailed comments showing IP ranges, hostname mappings, and host counts.
+.TP
+.BR \-o " " \fIoutput\fR
+Write output to specified file instead of standard output.
+.TP
+.BR \-h
+Show help message and exit.
+
+.SH FEATURES
+.IP \(bu 2
+Automatically handles Class C network boundaries
+.IP \(bu 2
+Skips reserved network (.0) and broadcast (.255) addresses
+.IP \(bu 2
+Sequential host numbering across multiple networks
+.IP \(bu 2
+Generates both A and optional MX record directives
+.IP \(bu 2
+Validates IPv4 addresses and ranges
+.IP \(bu 2
+Supports custom hostname prefixes and DNS domains
+.IP \(bu 2
+Provides detailed comments for generated ranges
+
+.SH EXAMPLES
+.PP
+Generate basic $GENERATE directives for a simple range:
+.RS
+.nf
+dhcpgen 10.1.50.10 10.1.50.50
+.fi
+.RE
+
+.PP
+Generate with comments and custom hostname:
+.RS
+.nf
+dhcpgen -comments -hostname guest 10.1.50.10 10.1.51.20
+.fi
+.RE
+
+.PP
+Generate with custom starting number and domain:
+.RS
+.nf
+dhcpgen -hoststart 100 -hostname dhcp -origin example.com 192.168.1.10 192.168.2.10
+.fi
+.RE
+
+.PP
+Generate with MX records:
+.RS
+.nf
+dhcpgen -mx mail.example.com -mx_priority 10 -origin example.com 10.0.1.1 10.0.1.100
+.fi
+.RE
+
+.SH INPUT FORMAT
+The program requires two IPv4 addresses as arguments:
+.IP \(bu 2
+\fIstart_ip\fR: Starting IP address of the range
+.IP \(bu 2
+\fIend_ip\fR: Ending IP address of the range (inclusive)
+
+Both addresses must be valid IPv4 addresses, and start_ip must be less than or equal to end_ip.
+
+.SH OUTPUT FORMAT
+The program generates DNS $GENERATE directives in standard format:
+
+.PP
+Basic A record generation:
+.RS
+.nf
+$GENERATE 10-50 dhcp-${0,2,d} IN A 10.1.50.$
+.fi
+.RE
+
+.PP
+With comments enabled:
+.RS
+.nf
+; Creating $GENERATE directives for addresses 10.1.50.10 through 10.1.50.50
+; 41 hosts total, starting from host 0
+
+; 10.1.50.10-10.1.50.50 => dhcp-00 to dhcp-40, 41 hosts
+$GENERATE 10-50 dhcp-${0,2,d} IN A 10.1.50.$
+.fi
+.RE
+
+.PP
+With MX records:
+.RS
+.nf
+$GENERATE 10-50 dhcp-${0,2,d} IN A 10.1.50.$
+$GENERATE 10-50 dhcp-${0,2,d} IN MX "10 mail.example.com."
+.fi
+.RE
+
+.SH NETWORK HANDLING
+The program intelligently handles Class C network boundaries:
+.IP \(bu 2
+Automatically splits ranges across /24 network boundaries
+.IP \(bu 2
+Skips .0 (network) and .255 (broadcast) addresses
+.IP \(bu 2
+Maintains sequential host numbering across networks
+.IP \(bu 2
+Generates separate $GENERATE directives for each network
+
+.PP
+Example across network boundary:
+.RS
+.nf
+dhcpgen -comments 10.1.0.250 10.1.1.10
+
+; 10.1.0.250-10.1.0.255 => dhcp-0 to dhcp-4, 5 hosts
+$GENERATE 250-254 dhcp-${0,2,d} IN A 10.1.0.$
+
+; 10.1.1.0-10.1.1.10 => dhcp-5 to dhcp-14, 10 hosts  
+$GENERATE 1-10 dhcp-${5,2,d} IN A 10.1.1.$
+.fi
+.RE
+
+.SH EXIT STATUS
+.B dhcpgen
+exits with status 0 on success, or 1 if an error occurs:
+.IP \(bu 2
+Invalid IP address format
+.IP \(bu 2
+Invalid IP range (start > end)
+.IP \(bu 2
+Negative host start number
+.IP \(bu 2
+Empty hostname prefix
+.IP \(bu 2
+Invalid DNS domain format
+.IP \(bu 2
+No valid host addresses in range
+.IP \(bu 2
+File I/O errors
+
+.SH SEE ALSO
+.BR mkarpa3 (1),
+.BR named (8),
+.BR named-checkzone (8)
+
+.SH AUTHOR
+Part of the zone-tools suite for DNS zone file management.

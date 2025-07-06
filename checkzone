@@ -1,20 +1,81 @@
 #!/bin/bash
-# 
-# Run named-checkzone to syntax check a zone file
+#
+# checkzone - Validate DNS zone files using named-checkzone
+#
+# This script provides a simple wrapper around named-checkzone for validating
+# DNS zone file syntax. It automatically detects the zone type and extracts
+# the appropriate domain name for validation.
+#
+# Usage:
+#   checkzone <zone_file>
+#
+# Examples:
+#   checkzone example.com.zone     # Forward zone validation
+#   checkzone 10.0.0.inaddr        # Reverse zone validation
+#   checkzone test.zone             # Any zone file
+#
+# The script automatically:
+# - Extracts $ORIGIN from forward zones for proper domain validation
+# - Uses root domain "." for reverse zones (*.inaddr files)
+# - Reports validation results with clear output
+# - Exits with proper status codes for scripting
+#
+# Exit codes:
+#   0 - Zone file is valid
+#   1 - Zone file has syntax errors
 #
 
-QUIET="-q"
+# Configuration
+QUIET="-q"                    # Run named-checkzone in quiet mode
 
-ZONEFILE=$1
-DOMAIN="."
-
-echo -n " > $ZONEFILE: "
-if [[ "$1" != *.inaddr ]]; then
-    DOMAIN=$(grep "^\$ORIGIN" $ZONEFILE | awk '{print $2}')
+# Input validation
+if [ $# -eq 0 ]; then
+    echo "Error: No zone file specified"
+    echo "Usage: checkzone <zone_file>"
+    exit 1
 fi
 
-named-checkzone $QUIET $DOMAIN $ZONEFILE
-if [ $? -ne 0 ]; then
+# Get zone file from command line argument
+ZONEFILE="$1"
+DOMAIN="."                    # Default domain for reverse zones
+
+# Validate zone file exists and is readable
+if [ ! -f "$ZONEFILE" ]; then
+    echo "Error: Zone file '$ZONEFILE' not found"
+    exit 1
+fi
+
+if [ ! -r "$ZONEFILE" ]; then
+    echo "Error: Zone file '$ZONEFILE' is not readable"
+    exit 1
+fi
+
+# Display zone file being checked
+echo -n " > $ZONEFILE: "
+
+# Determine domain name based on file type
+if [[ "$ZONEFILE" != *.inaddr && "$ZONEFILE" != *.arpa ]]; then
+    # For forward zones, extract domain from $ORIGIN directive
+    # Get the last $ORIGIN directive (in case there are multiple)
+    EXTRACTED_DOMAIN=$(grep -i "^\$ORIGIN" "$ZONEFILE" | tail -1 | awk '{print $2}')
+    
+    if [ -n "$EXTRACTED_DOMAIN" ]; then
+        # Remove trailing dot if present for consistency
+        DOMAIN="${EXTRACTED_DOMAIN%.}"
+        # Add trailing dot back (named-checkzone expects it)
+        DOMAIN="${DOMAIN}."
+    else
+        echo "Warning: No \$ORIGIN directive found in forward zone, using root domain"
+    fi
+fi
+# Note: Reverse zones (*.inaddr, *.arpa) use root domain "." by default
+
+# Run named-checkzone validation
+named-checkzone $QUIET "$DOMAIN" "$ZONEFILE"
+exit_code=$?
+
+# Check validation result and report status
+if [ $exit_code -ne 0 ]; then
     echo "INVALID"
     exit 1
 fi

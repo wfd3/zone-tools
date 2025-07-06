@@ -1,0 +1,23 @@
+; Main zone file that includes other files
+$TTL 3600
+$ORIGIN include.example.
+
+@	IN	SOA	ns1.include.example. admin.include.example. (
+		2023010401	; Serial
+		3600		; Refresh
+		1800		; Retry
+		604800		; Expire
+		86400 )		; Minimum TTL
+
+@	IN	NS	ns1.include.example.
+@	IN	A	203.0.113.1
+
+; Include hosts file
+$INCLUDE testdata/hosts.zone
+
+; Include services file  
+$INCLUDE testdata/services.zone
+
+; Local records after includes
+local1	IN	A	203.0.113.10
+local2	IN	A	203.0.113.11
