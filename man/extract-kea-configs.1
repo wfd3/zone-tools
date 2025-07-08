@@ -1,0 +1,157 @@
+.TH EXTRACT-KEA-CONFIGS 1 "2025-07-08" "zone-tools" "DNS Zone Management"
+.SH NAME
+extract-kea-configs \- Extract network configurations from Kea DHCP config files
+.SH SYNOPSIS
+.B extract-kea-configs
+[\fIOPTIONS\fR] \fIkea-config-file\fR \fIzone-file\fR
+.SH DESCRIPTION
+.B extract-kea-configs.py
+parses Kea DHCP configuration files to automatically extract network configurations and generate DHCP reservation files using the mkkea tool. The script identifies subnet definitions and their corresponding include directives, then processes each network to create appropriate reservation files.
+
+The script handles Kea's JSON-with-comments format by cleaning the configuration file to make it valid JSON, then parsing the structure to extract subnet and include information.
+
+.SH OPTIONS
+.TP
+.BR \-m ", " \-\-mkkea " " \fIcommand\fR
+Specify the path to the mkkea command. Default is "mkkea".
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output showing detailed processing information.
+.TP
+.BR \-n ", " \-\-dry\-run
+Perform a dry run showing what commands would be executed without actually running them.
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+
+.SH ARGUMENTS
+.TP
+.I kea-config-file
+Path to the Kea DHCP configuration file to parse. The file should contain subnet4 definitions with include directives.
+.TP
+.I zone-file
+Path to the DNS zone file that will be processed by mkkea to generate DHCP reservations.
+
+.SH CONFIGURATION FORMAT
+The script expects Kea configuration files with the following structure:
+
+.nf
+{
+  "Dhcp4": {
+    "subnet4": [
+      {
+        "subnet": "10.0.0.0/16",
+        "reservations": [
+          <?include "./kea-unrestricted.conf"?>
+        ]
+      },
+      {
+        "subnet": "10.253.0.0/16", 
+        "reservations": [
+          <?include "./kea-restricted.conf"?>
+        ]
+      }
+    ]
+  }
+}
+.fi
+
+.SH NETWORK IDENTIFICATION
+The script uses the filename from the include directive as the network identifier. For example:
+.IP \(bu 2
+<?include "./kea-unrestricted.conf"?> creates network "kea-unrestricted.conf"
+.IP \(bu 2
+<?include "./kea-hosts.conf"?> creates network "kea-hosts.conf"
+
+This approach works with any filename convention and doesn't require specific comment formatting.
+
+.SH KEA EXTENSIONS HANDLED
+The script handles the following Kea-specific JSON extensions:
+.IP \(bu 2
+Comments starting with # (outside quoted strings)
+.IP \(bu 2
+<?include "filename"?> directives
+
+These extensions are cleaned from the JSON before parsing to ensure compatibility with standard JSON parsers.
+
+.SH OUTPUT
+For each network configuration found, the script:
+.IP 1. 3
+Identifies the subnet CIDR and include filename
+.IP 2. 3
+Runs mkkea with the appropriate network filter
+.IP 3. 3
+Generates a DHCP reservation file
+
+The output shows:
+.IP \(bu 2
+Network processing status with CIDR and output filename
+.IP \(bu 2
+Success/failure indicators for each generated file
+.IP \(bu 2
+Summary of total configurations processed
+
+.SH EXAMPLES
+.TP
+Basic usage:
+.B extract-kea-configs.py kea-dhcp4.conf zones/example.com.zone
+
+.TP
+With custom mkkea path:
+.B extract-kea-configs.py -m /usr/local/bin/mkkea kea-dhcp4.conf zone.file
+
+.TP
+Verbose dry run:
+.B extract-kea-configs.py -v -n kea-dhcp4.conf zone.file
+
+.TP
+Full path example:
+.B extract-kea-configs.py -m ../bin/mkkea NEW.conf ../zones/home.example.com.zone
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success - all network configurations processed successfully
+.TP
+.B 1
+Error - invalid arguments, file not found, JSON parsing error, or mkkea execution failure
+
+.SH FILES
+.TP
+.I kea-dhcp4.conf
+Typical Kea DHCP configuration file
+.TP
+.I *.zone
+DNS zone files containing host records with TXT records for DHCP configuration
+
+.SH DEPENDENCIES
+.IP \(bu 2
+Python 3.6 or later
+.IP \(bu 2
+mkkea command (from zone-tools package)
+.IP \(bu 2
+Valid Kea DHCP configuration file
+.IP \(bu 2
+DNS zone file with TXT records containing kea: directives
+
+.SH SEE ALSO
+.BR mkkea (1),
+.BR kea-dhcp4 (8),
+.BR named-checkzone (1)
+
+.SH COMPATIBILITY
+Works with Kea DHCP server configuration files. Tested with Kea versions that support the <?include ?> directive and JSON-with-comments format.
+
+.SH LIMITATIONS
+.IP \(bu 2
+Requires include directives in subnet reservations for network identification
+.IP \(bu 2
+Assumes include files follow the "./filename" path format
+.IP \(bu 2
+May need updates for future Kea JSON extensions beyond <?include ?> and # comments
+
+.SH AUTHOR
+Generated as part of the zone-tools DNS management suite.
+
+.SH BUGS
+Report bugs to the zone-tools project maintainer.

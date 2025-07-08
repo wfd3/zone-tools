@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+extract-kea-configs.py - Extract network configurations from Kea config file
+
+This script parses a Kea DHCP configuration file and extracts network:filename
+pairs from subnet definitions, then generates DHCP reservations for each network
+from DNS zone files to be included in the kea config.
+
+Usage:
+  extract-kea-configs.py [options] <kea-config-file> <zone-file>
+
+Options:
+  -m, --mkkea <cmd>    Path to mkkea command (default: mkkea)
+  -v, --verbose        Verbose output  
+  -n, --dry-run        Dry run - show what would be done
+  -h, --help           Show help
+
+The script looks for subnet4 entries with comment-based network names and
+include directives to determine which networks to process.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+# Remove the extract_network_name_from_filename function - we'll use the whole filename
+
+
+def extract_include_filename(include_line: str) -> Optional[str]:
+    """Extract filename from include directive like '<?include "./kea-unrestricted.conf"?>'"""
+    match = re.search(r'include\s*"\./([^"]+)"', include_line)
+    if match:
+        return match.group(1)
+    return None
+
+
+def clean_kea_json(content: str) -> Tuple[str, Dict[int, str]]:
+    """
+    Clean Kea JSON by removing comments and known Kea extensions.
+    
+    Known Kea extensions handled:
+    - Comments starting with # (outside of quoted strings)
+    - <?include "filename"?> directives
+    
+    Returns (cleaned_json, comments_map) where comments_map maps
+    line numbers to comment content for later reference.
+    
+    Note: This function handles known Kea extensions as of the implementation date.
+    Future Kea versions may introduce new syntax that requires updates.
+    """
+    lines = content.split('\n')
+    cleaned_lines = []
+    comments_map = {}
+    
+    for i, line in enumerate(lines):
+        original_line = line
+        
+        # Handle inline comments (# not inside quotes)
+        if '#' in line:
+            in_quotes = False
+            escape_next = False
+            comment_pos = -1
+            
+            for j, char in enumerate(line):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if char == '\\':
+                    escape_next = True
+                    continue
+                if char == '"':
+                    in_quotes = not in_quotes
+                    continue
+                if char == '#' and not in_quotes:
+                    comment_pos = j
+                    break
+            
+            if comment_pos >= 0:
+                comment = line[comment_pos:].strip()
+                if comment:
+                    comments_map[i] = comment
+                line = line[:comment_pos].rstrip()
+        
+        # Handle known Kea extensions:
+        # 1. <?include ?> directives - replace with empty object placeholder
+        if '<?include' in line:
+            line = re.sub(r'<\?include\s+"[^"]*"\s*\?>', '{}', line)
+        
+        # Future Kea extensions could be handled here with additional patterns
+        # Examples that might need handling in future versions:
+        # - <?macro ?> directives
+        # - <?variable ?> substitutions
+        # - Other <? ?> bracketed extensions
+        
+        cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines), comments_map
+
+
+def parse_kea_config(config_file: Path, verbose: bool = False) -> List[Tuple[str, str, str]]:
+    """
+    Parse Kea config file and extract network configurations.
+    
+    Returns list of (filename, filename, cidr) tuples where the first filename
+    is used as the network identifier.
+    """
+    if verbose:
+        print(f"[DEBUG] Parsing Kea config: {config_file}", file=sys.stderr)
+    
+    try:
+        with open(config_file, 'r') as f:
+            original_content = f.read()
+        
+        # Clean the Kea-specific syntax to make it valid JSON
+        cleaned_json, comments_map = clean_kea_json(original_content)
+        
+        if verbose:
+            print(f"[DEBUG] Cleaned JSON, found {len(comments_map)} comments", file=sys.stderr)
+        
+        # Parse the cleaned JSON
+        config = json.loads(cleaned_json)
+        
+        if verbose:
+            print(f"[DEBUG] Successfully parsed JSON config", file=sys.stderr)
+        
+        # Extract subnet4 configurations
+        subnet4_list = config.get('Dhcp4', {}).get('subnet4', [])
+        if not subnet4_list:
+            if verbose:
+                print(f"[DEBUG] No subnet4 configurations found", file=sys.stderr)
+            return []
+        
+        configurations = []
+        
+        for subnet in subnet4_list:
+            if verbose:
+                print(f"[DEBUG] Processing subnet: {subnet.get('subnet', 'unknown')}", file=sys.stderr)
+            
+            # Extract network CIDR
+            network_cidr = subnet.get('subnet')
+            if not network_cidr:
+                if verbose:
+                    print(f"[DEBUG] No subnet CIDR found, skipping", file=sys.stderr)
+                continue
+            
+            # Find the include filename by looking in the original content
+            # Find the end of this subnet block in original content
+            subnet_start = original_content.find(f'"subnet": "{network_cidr}"')
+            next_subnet_start = original_content.find('"subnet":', subnet_start + 1)
+            subnet_end = next_subnet_start if next_subnet_start != -1 else len(original_content)
+            
+            subnet_content = original_content[subnet_start:subnet_end]
+            include_match = re.search(r'<\?include\s+"\.\/([^"]+)"\s*\?>', subnet_content)
+            
+            if include_match:
+                include_filename = include_match.group(1)
+                
+                if verbose:
+                    print(f"[DEBUG] Found include file: {include_filename}", file=sys.stderr)
+                
+                # Use the filename as both the network identifier and output filename
+                if include_filename and network_cidr:
+                    configurations.append((include_filename, include_filename, network_cidr))
+                    if verbose:
+                        print(f"[DEBUG] Added config: {include_filename}:{include_filename}:{network_cidr}", file=sys.stderr)
+            else:
+                if verbose:
+                    print(f"[DEBUG] No include directive found for subnet {network_cidr}", file=sys.stderr)
+        
+        return configurations
+        
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in config file: {e}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"Error parsing config file: {e}", file=sys.stderr)
+        return []
+
+
+def run_mkkea(mkkea_cmd: str, network_cidr: str, output_file: str, zone_file: Path, 
+              verbose: bool = False, dry_run: bool = False) -> bool:
+    """Run mkkea command to generate DHCP reservations"""
+    cmd = [mkkea_cmd, '-n', network_cidr, '-o', output_file, str(zone_file)]
+    
+    if dry_run:
+        print(f"\033[33m[DRY RUN]\033[0m {' '.join(cmd)}")
+        return True
+    
+    if verbose:
+        print(f"[DEBUG] Executing: {' '.join(cmd)}", file=sys.stderr)
+    
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error: Failed to run mkkea: {e}", file=sys.stderr)
+        if e.stdout:
+            print(f"stdout: {e.stdout}", file=sys.stderr)
+        if e.stderr:
+            print(f"stderr: {e.stderr}", file=sys.stderr)
+        return False
+    except FileNotFoundError:
+        print(f"Error: mkkea command not found: {mkkea_cmd}", file=sys.stderr)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Extract network configurations from Kea config and generate DHCP reservations.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s kea-dhcp4.conf ../zones/example.com.zone
+  %(prog)s -v -m /usr/local/bin/mkkea kea-dhcp4.conf zone.file
+  %(prog)s -n kea-dhcp4.conf zone.file  # Just show what would run
+
+The script parses Kea config files looking for subnet blocks with:
+  - Network description comments (e.g., "# Unrestricted Network")  
+  - Subnet definitions (e.g., "subnet": "10.0.0.0/16")
+  - Include files (e.g., <?include "./kea-unrestricted.conf"?>)
+        """)
+    
+    parser.add_argument('-m', '--mkkea', default='mkkea',
+                        help='Path to mkkea command (default: mkkea)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose output')
+    parser.add_argument('-n', '--dry-run', action='store_true',
+                        help='Dry run - show what would be done')
+    parser.add_argument('kea_config', type=Path,
+                        help='Kea configuration file')
+    parser.add_argument('zone_file', type=Path,
+                        help='DNS zone file')
+    
+    args = parser.parse_args()
+    
+    # Validate input files
+    if not args.kea_config.exists():
+        print(f"Error: Kea config file not found: {args.kea_config}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not args.kea_config.is_file():
+        print(f"Error: Kea config path is not a file: {args.kea_config}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not args.zone_file.exists():
+        print(f"Error: Zone file not found: {args.zone_file}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not args.zone_file.is_file():
+        print(f"Error: Zone file path is not a file: {args.zone_file}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Check if mkkea command exists (unless dry run)
+    if not args.dry_run:
+        try:
+            subprocess.run([args.mkkea, '--help'], capture_output=True, check=False)
+        except FileNotFoundError:
+            print(f"Error: mkkea command not found: {args.mkkea}", file=sys.stderr)
+            sys.exit(1)
+    
+    if args.verbose:
+        print(f"[DEBUG] Using mkkea command: {args.mkkea}", file=sys.stderr)
+        print(f"[DEBUG] Kea config file: {args.kea_config}", file=sys.stderr)
+        print(f"[DEBUG] Zone file: {args.zone_file}", file=sys.stderr)
+    
+    # Extract network configurations
+    print(f"\033[34m*\033[0m Extracting network configurations from {args.kea_config.name}")
+    
+    configurations = parse_kea_config(args.kea_config, args.verbose)
+    
+    if not configurations:
+        print(f"\033[33mWarning:\033[0m No network configurations found in {args.kea_config}", file=sys.stderr)
+        print("Make sure your config has the expected format:", file=sys.stderr)
+        print("  # NetworkName Network - Description", file=sys.stderr)  
+        print('  "subnet": "10.0.0.0/16"', file=sys.stderr)
+        print('  <?include "./filename.conf"?>', file=sys.stderr)
+        return
+    
+    # Process each configuration
+    success_count = 0
+    
+    for filename, output_filename, network_cidr in configurations:
+        print(f"\033[34m*\033[0m Processing {filename} ({network_cidr}) → {output_filename}")
+        
+        if run_mkkea(args.mkkea, network_cidr, output_filename, args.zone_file, args.verbose, args.dry_run):
+            success_count += 1
+            if not args.dry_run:
+                print(f"  \033[32m✓\033[0m Generated {output_filename}")
+        else:
+            print(f"  \033[31m✗\033[0m Failed to generate {output_filename}", file=sys.stderr)
+    
+    if success_count == 0:
+        print(f"\033[33mWarning:\033[0m No configurations processed successfully", file=sys.stderr)
+        sys.exit(1)
+    else:
+        plural = 's' if success_count != 1 else ''
+        print(f"\033[34m*\033[0m Successfully processed {success_count} network configuration{plural}")
+
+
+if __name__ == '__main__':
+    main()
