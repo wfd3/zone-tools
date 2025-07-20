@@ -176,10 +176,10 @@ def parse_kea_config(config_file: Path, verbose: bool = False) -> List[Tuple[str
         
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON in config file: {e}", file=sys.stderr)
-        return []
+        sys.exit(1)
     except Exception as e:
         print(f"Error parsing config file: {e}", file=sys.stderr)
-        return []
+        sys.exit(1)
 
 
 def run_mkkea(mkkea_cmd: str, network_cidr: str, output_file: str, zone_file: Path, 
@@ -269,7 +269,6 @@ The script parses Kea config files looking for subnet blocks with:
         print(f"[DEBUG] Zone file: {args.zone_file}", file=sys.stderr)
     
     # Extract network configurations
-    print(f"\033[34m*\033[0m Extracting network configurations from {args.kea_config.name}")
     
     configurations = parse_kea_config(args.kea_config, args.verbose)
     
@@ -279,7 +278,7 @@ The script parses Kea config files looking for subnet blocks with:
         print("  # NetworkName Network - Description", file=sys.stderr)  
         print('  "subnet": "10.0.0.0/16"', file=sys.stderr)
         print('  <?include "./filename.conf"?>', file=sys.stderr)
-        return
+        sys,exit(1)
     
     # Process each configuration
     success_count = 0

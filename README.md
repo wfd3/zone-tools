@@ -9,6 +9,7 @@ A collection of DNS zone file management utilities for automating common DNS adm
 - **mkkea** - Generate Kea DHCP reservations from DNS zone files  
 - **dhcpgen** - Generate DNS $GENERATE directives for DHCP host ranges
 - **checkzone** - Wrapper around named-checkzone
+- **extract-kea-configs** - Extract network configurations from Kea DHCP config files
 
 ### Zone File Parser Library
 - **zoneparser** - Go library for parsing DNS zone files with support for $GENERATE, $INCLUDE, and various record types
@@ -149,8 +150,64 @@ checkzone example.com.zone
  > example.com.zone: valid
 ```
 
+### extract-kea-configs
+Automatically extracts network configurations from Kea DHCP configuration files and generates DHCP reservation files for each network.
+
+**Key Features:**
+- Parses Kea JSON-with-comments configuration format
+- Handles <?include ?> directives and # comments automatically
+- Extracts subnet definitions and include filenames
+- Generates separate DHCP reservation files per network
+- Works with any include filename convention
+- No dependency on comment formatting or network naming schemes
+
+**Configuration Format:**
+The script works with standard Kea DHCP configurations:
+```json
+{
+  "Dhcp4": {
+    "subnet4": [
+      {
+        "subnet": "10.0.0.0/16",
+        "reservations": [
+          <?include "./kea-unrestricted.conf"?>
+        ]
+      },
+      {
+        "subnet": "10.253.0.0/16",
+        "reservations": [
+          <?include "./kea-restricted.conf"?>
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Usage:**
+```bash
+extract-kea-configs [options] <kea-config-file> <zone-file>
+```
+
+**Example:**
+```bash
+# Extract all network configurations from Kea config
+extract-kea-configs kea-dhcp4.conf zones/example.com.zone
+```
+
+**Example Output:**
+```
+* Extracting network configurations from kea-dhcp4.conf
+* Processing kea-unrestricted.conf (10.0.0.0/16) → kea-unrestricted.conf
+  ✓ Generated kea-unrestricted.conf
+* Processing kea-restricted.conf (10.253.0.0/16) → kea-restricted.conf
+  ✓ Generated kea-restricted.conf
+* Successfully processed 2 network configurations
+```
+
 ## Prerequisites
 - Go 1.19+ (for Go tools)
+- Python 3.6+ (for extract-kea-configs)
 - BIND named-checkzone (for checkzone script)
 
 ## Zone Parser Library
@@ -190,6 +247,7 @@ Comprehensive manual pages are available in the `man/` directory:
 - `man/mkarpa3.1` - Reverse zone generation
 - `man/mkkea3.1` - DHCP reservation extraction  
 - `man/dhcpgen.1` - DHCP range generation
+- `man/extract-kea-configs.1` - Kea configuration parsing and network extraction
 
 ## Error Handling
 
